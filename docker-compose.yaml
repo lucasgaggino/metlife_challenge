@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: metlife_postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: metlife_db
+      POSTGRES_USER: metlife_user
+      POSTGRES_PASSWORD: metlife_pass
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metlife_user -d metlife_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - metlife_network
+
+# ML Pipeline
+  ml_pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: metlife_ml_pipeline
+    restart: on-failure
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      # Database config
+      DB_HOST: postgres
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-metlife_db}
+      DB_USER: ${DB_USER:-metlife_user}
+      DB_PASSWORD: ${DB_PASSWORD:-metlife_pass}
+
+      # ML config
+      PYTHONUNBUFFERED: 1
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      HYPERPARAM_ITERATIONS: ${HYPERPARAM_ITERATIONS:-50}
+      CV_FOLDS: ${CV_FOLDS:-5}
+      SCORING_SAMPLE_SIZE: ${SCORING_SAMPLE_SIZE:-10}
+
+    volumes:
+      # Persistir outputs
+      - ./models:/app/models
+      - ./results:/app/results
+      - ./logs:/app/logs
+
+    networks:
+      - metlife_network
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  metlife_network:
+    driver: bridge
