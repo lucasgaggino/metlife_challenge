@@ -55,6 +55,7 @@ cover/
 *.mo
 *.pot
 
+
 # Django stuff:
 *.log
 local_settings.py
@@ -210,6 +211,9 @@ __marimo__/
 *.pkl
 *.json
 *.txt
+
+!requirements.txt
+
 
 # MLflow artifacts / local store
 mlartifacts/
