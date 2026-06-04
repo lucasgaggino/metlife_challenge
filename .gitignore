@@ -213,15 +213,30 @@ __marimo__/
 *.txt
 
 !requirements.txt
+!grafana/**/*.json
 
+# Salidas del pipeline: versionar carpetas (.gitkeep), ignorar el resto
+logs/*
+!logs/.gitkeep
+!logs/prod/
+logs/prod/*
+!logs/prod/.gitkeep
 
-# MLflow artifacts / local store
-mlartifacts/
+models/*
+!models/.gitkeep
+!models/prod/
+models/prod/*
+!models/prod/.gitkeep
+
+results/*
+!results/.gitkeep
+!results/prod/
+results/prod/*
+!results/prod/.gitkeep
+
+# MLflow artifacts / local store (carpeta si, contenido no)
+mlartifacts/*
+!mlartifacts/.gitkeep
 mlruns/
-
-# Artefactos del entorno Prod MLOps
-models/prod/
-results/prod/
-logs/prod/
 
 *.DS_Store

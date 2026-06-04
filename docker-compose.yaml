@@ -148,9 +148,9 @@ services:
       MLFLOW_MODEL_NAME: metlife_insurance_xgb_prod
 
     volumes:
-      - ./models/prod:/app/models/prod
-      - ./results/prod:/app/results/prod
-      - ./logs/prod:/app/logs/prod
+      - ./models:/app/models
+      - ./results:/app/results
+      - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro
       - ./config.prod.yaml:/app/config.prod.yaml:ro
 

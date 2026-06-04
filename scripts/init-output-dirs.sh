@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Crea carpetas de salida con permisos amplios para Docker (evita Permission denied en ./logs).
-set -e
-cd "$(dirname "$0")/.."
-mkdir -p models results logs models/prod results/prod logs/prod
-chmod -R 777 models results logs 2>/dev/null || true
-echo "OK: models/, results/, logs/ listos para docker compose."
+# Crea carpetas de salida del pipeline (idempotente). Se commitean via .gitkeep;
+# este script sirve si alguien clono sin esas rutas o las borro localmente.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+for d in logs logs/prod models models/prod results results/prod mlartifacts; do
+  mkdir -p "$ROOT/$d"
+  touch "$ROOT/$d/.gitkeep"
+done
+echo "Directorios de salida listos en $ROOT"

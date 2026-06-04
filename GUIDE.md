@@ -39,6 +39,18 @@ Puertos libres en el host: **5432** (Postgres), **5000** (MLflow), **3000** (Gra
 cd metlife-challenge-mlops
 ```
 
+Las carpetas de salida (`logs/`, `logs/prod/`, `models/`, `models/prod/`, `results/`, `results/prod/`, `mlartifacts/`) vienen en el repo con `.gitkeep` para que Docker pueda montarlas sin error de permisos. Si faltan:
+
+```bash
+bash scripts/init-output-dirs.sh
+```
+
+Si ya corriste Docker y `logs/` quedó creada como root (error `Permission denied` en `tee`), corregí permisos en el host:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" logs models results mlartifacts
+```
+
 ### 3.2 Variables de entorno (infra y secretos)
 
 ```bash
@@ -74,24 +86,6 @@ Construye:
 - `ml_pipeline` — pipeline Python (training + scoring)
 - `mlflow` — servidor de tracking
 - `grafana` — dashboards (imagen oficial)
-
-### 3.4.1 Carpetas de salida (importante en Linux / clones nuevos)
-
-El contenedor escribe en `./models`, `./results` y `./logs`. Si esas carpetas las creó Docker como `root`, verás `Permission denied` al arrancar.
-
-**Linux / Mac:**
-
-```bash
-bash scripts/init-output-dirs.sh
-```
-
-**Windows (PowerShell):**
-
-```powershell
-.\scripts\init-output-dirs.ps1
-```
-
-O manualmente: `mkdir models results logs` y, en Linux, `chmod -R 777 models results logs`.
 
 ### 3.5 Levantar todo y correr el pipeline
 
@@ -445,7 +439,6 @@ Borra volúmenes de Postgres y Grafana; pierde historial de `training_runs` en D
 
 | Problema | Qué revisar |
 |----------|-------------|
-| `tee: /app/logs/... Permission denied` | Permisos del volumen `./logs` (y `./models`, `./results`). Ejecutar `scripts/init-output-dirs.sh` o `.ps1`, o `chmod -R 777 models results logs`. El entrypoint usa `/tmp` solo para logs si `./logs` no es escribible; modelos/reportes siguen necesitando carpetas con permiso en el host. |
 | `ml_pipeline` sale al instante | `docker compose logs ml_pipeline` — fallo en db_setup/training |
 | MLflow no responde | `docker compose ps` — servicio `mlflow` healthy en :5000 |
 | Todos los batches schema ALERT | `smoker`/`sex` en YAML deben ir entre comillas `"yes"` |
