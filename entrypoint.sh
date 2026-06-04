@@ -14,10 +14,51 @@ readonly BLUE='\033[0;34m'
 readonly NC='\033[0m' # No Color
 
 
-# Logging
-LOG_DIR="/app/logs"
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/pipeline_$(date +%Y%m%d_%H%M%S).log"
+# --- Permisos en volumenes montados (./logs, ./models, ./results) ---
+# El contenedor corre como appuser; si el host creo carpetas como root, tee falla.
+dir_writable() {
+    local d="$1"
+    mkdir -p "$d" 2>/dev/null || return 1
+    touch "$d/.write_test" 2>/dev/null && rm -f "$d/.write_test" 2>/dev/null
+}
+
+init_log_dir() {
+    LOG_DIR="${PIPELINE_LOG_DIR:-/app/logs}"
+    if ! dir_writable "$LOG_DIR"; then
+        LOG_DIR="/tmp/metlife-pipeline-logs"
+        mkdir -p "$LOG_DIR"
+        LOG_DIR_FALLBACK=1
+    fi
+    LOG_FILE="$LOG_DIR/pipeline_$(date +%Y%m%d_%H%M%S).log"
+    touch "$LOG_FILE" 2>/dev/null || LOG_FILE=""
+}
+
+check_output_dirs() {
+    local failed=0
+    for d in /app/models /app/results; do
+        if ! dir_writable "$d"; then
+            echo -e "${RED}[ERROR]${NC} Sin permiso de escritura en ${d}." >&2
+            echo "  El volumen montado desde el host no es escribible por el usuario del contenedor (appuser)." >&2
+            echo "  En la raiz del repo (host), ejecuta:" >&2
+            echo "    mkdir -p models results logs models/prod results/prod logs/prod" >&2
+            echo "    chmod -R 777 models results logs   # Linux/Mac" >&2
+            echo "  O borra las carpetas logs/models/results y vuelve a crearlas con tu usuario." >&2
+            failed=1
+        fi
+    done
+    return $failed
+}
+
+init_log_dir
+check_output_dirs || exit 1
+
+_append_log() {
+    if [ -n "${LOG_FILE:-}" ]; then
+        tee -a "$LOG_FILE" 2>/dev/null || cat
+    else
+        cat
+    fi
+}
 
 # Función de logging
 log() {
@@ -25,24 +66,28 @@ log() {
     shift
     local message="$@"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
+    echo "[$timestamp] [$level] $message" | _append_log
 }
 
-log_info() { 
-    echo -e "${BLUE}[INFO]${NC} $@" | tee -a "$LOG_FILE"
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $@" | _append_log
 }
 
-log_warn() { 
-    echo -e "${YELLOW}[WARN]${NC} $@" | tee -a "$LOG_FILE"
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $@" | _append_log
 }
 
-log_error() { 
-    echo -e "${RED}[ERROR]${NC} $@" | tee -a "$LOG_FILE"
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $@" | _append_log
 }
 
-log_success() { 
-    echo -e "${GREEN}[SUCCESS]${NC} $@" | tee -a "$LOG_FILE"
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $@" | _append_log
 }
+
+if [ "${LOG_DIR_FALLBACK:-0}" = "1" ]; then
+    log_warn "/app/logs no es escribible (permisos del volumen host). Logs en: ${LOG_DIR}"
+fi
 
 # Banner
 echo -e "${BLUE}"
@@ -103,6 +148,34 @@ wait_for_mlflow() {
     log_success "MLflow está listo!"
 }
 
+_resolve_output_paths() {
+    local out
+    out=$(python -c "
+import os, sys
+sys.path.insert(0, '/app/src')
+from config_loader import load_config, get_paths
+load_config(force_reload=True)
+p = get_paths()
+def to_abs(path, default):
+    path = path or default
+    return path if os.path.isabs(path) else os.path.join('/app', path)
+print(to_abs(p.get('models_dir'), 'models'))
+print(to_abs(p.get('results_dir'), 'results'))
+" 2>/dev/null) || true
+    if [ -n "$out" ]; then
+        OUTPUT_MODELS_DIR=$(echo "$out" | sed -n '1p')
+        OUTPUT_RESULTS_DIR=$(echo "$out" | sed -n '2p')
+    else
+        if [ "${ML_ENV:-sandbox}" = "prod" ]; then
+            OUTPUT_MODELS_DIR="/app/models/prod"
+            OUTPUT_RESULTS_DIR="/app/results/prod"
+        else
+            OUTPUT_MODELS_DIR="/app/models"
+            OUTPUT_RESULTS_DIR="/app/results"
+        fi
+    fi
+}
+
 run_python_script() {
     local script_name=$1
     local script_path="src/$script_name"
@@ -115,7 +188,7 @@ run_python_script() {
     log_info "Iniciando $script_name"
 
     # Ejecutar con logging
-    if python "$script_path" 2>&1 | tee -a "$LOG_FILE"; then
+    if python "$script_path" 2>&1 | _append_log; then
         log_success "$script_name completado exitosamente"
         return 0
     else
@@ -176,23 +249,38 @@ cat << "EOF"
 EOF
 echo -e "${NC}"
 
+_resolve_output_paths
+
 log_success "Pipeline completado exitosamente"
-log_info "Outputs generados:"
-log_info "  - Modelos: /app/models/"
-log_info "  - Reportes: /app/results/"
-log_info "  - Logs: $LOG_FILE"
+log_info "Outputs generados (rutas en el contenedor):"
+log_info "  - Modelos: ${OUTPUT_MODELS_DIR}/"
+log_info "  - Reportes: ${OUTPUT_RESULTS_DIR}/"
+if [ -n "${LOG_FILE:-}" ]; then
+    log_info "  - Log pipeline: ${LOG_FILE}"
+else
+    log_info "  - Log pipeline: solo consola (no se pudo escribir archivo)"
+fi
+if [ "${LOG_DIR_FALLBACK:-0}" = "1" ]; then
+    log_warn "  El log NO esta en ./logs del host; uso interno: ${LOG_DIR}"
+else
+    log_info "  En tu PC (repo): ./models ./results ./logs (mapeo Docker)"
+fi
 
 echo ""
 echo "Resumen de archivos generados:"
 echo "────────────────────────────────────────────"
-echo "MODELOS:"
-ls -lh /app/models/*.pkl 2>/dev/null || echo "  (sin archivos .pkl)"
+echo "MODELOS (${OUTPUT_MODELS_DIR}):"
+ls -lh "${OUTPUT_MODELS_DIR}"/*.pkl 2>/dev/null || echo "  (sin archivos .pkl en esta carpeta)"
 echo ""
-echo "RESULTADOS:"
-ls -lh /app/results/*.txt 2>/dev/null || echo "  (sin archivos .txt)"
+echo "RESULTADOS (${OUTPUT_RESULTS_DIR}):"
+ls -lh "${OUTPUT_RESULTS_DIR}"/*.txt 2>/dev/null || echo "  (sin archivos .txt en esta carpeta)"
 echo ""
-echo "LOGS:"
-ls -lh /app/logs/*.log 2>/dev/null || echo "  (sin archivos .log)"
+echo "LOGS (${LOG_DIR}):"
+if [ -n "${LOG_FILE:-}" ]; then
+    ls -lh "${LOG_FILE}" 2>/dev/null || echo "  (archivo de log no listable)"
+else
+    echo "  (sin archivo en disco)"
+fi
 echo "────────────────────────────────────────────"
 echo ""
 

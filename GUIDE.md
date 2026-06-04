@@ -75,6 +75,24 @@ Construye:
 - `mlflow` — servidor de tracking
 - `grafana` — dashboards (imagen oficial)
 
+### 3.4.1 Carpetas de salida (importante en Linux / clones nuevos)
+
+El contenedor escribe en `./models`, `./results` y `./logs`. Si esas carpetas las creó Docker como `root`, verás `Permission denied` al arrancar.
+
+**Linux / Mac:**
+
+```bash
+bash scripts/init-output-dirs.sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+.\scripts\init-output-dirs.ps1
+```
+
+O manualmente: `mkdir models results logs` y, en Linux, `chmod -R 777 models results logs`.
+
 ### 3.5 Levantar todo y correr el pipeline
 
 ```bash
@@ -427,6 +445,7 @@ Borra volúmenes de Postgres y Grafana; pierde historial de `training_runs` en D
 
 | Problema | Qué revisar |
 |----------|-------------|
+| `tee: /app/logs/... Permission denied` | Permisos del volumen `./logs` (y `./models`, `./results`). Ejecutar `scripts/init-output-dirs.sh` o `.ps1`, o `chmod -R 777 models results logs`. El entrypoint usa `/tmp` solo para logs si `./logs` no es escribible; modelos/reportes siguen necesitando carpetas con permiso en el host. |
 | `ml_pipeline` sale al instante | `docker compose logs ml_pipeline` — fallo en db_setup/training |
 | MLflow no responde | `docker compose ps` — servicio `mlflow` healthy en :5000 |
 | Todos los batches schema ALERT | `smoker`/`sex` en YAML deben ir entre comillas `"yes"` |
