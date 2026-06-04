@@ -114,6 +114,8 @@ metlife-insurance-prediction/
 
 ## 🚀 Instalación y Configuración
 
+Guía paso a paso (build → parámetros → reentrenar): **[GUIDE.md](GUIDE.md)**.
+
 ### **Requisitos Previos**
 
 - **Python**: 3.10 (probado con 3.10.19)
@@ -325,6 +327,117 @@ python src/training.py
 # 3. Scoring
 python src/scoring.py
 
+```
+
+---
+
+## 🔬 MLOps: MLflow, scoring de producción y monitoreo
+
+El pipeline incorpora tracking de experimentos, registro de modelo y monitoreo por batch.
+
+### 1) Entrenamiento con MLflow
+
+`src/training.py` registra cada corrida en MLflow:
+
+- **Params**: hiperparámetros, seed, features, `n_iter`, `cv_folds`.
+- **Métricas**: RMSE, MAE, R², Adjusted R², MAPE (train y validation) + overfitting.
+- **Artefactos**: modelo (`mlflow.sklearn`), reporte de training y metadata JSON.
+- **Registro + promoción**: el modelo se registra como `metlife_insurance_xgb` y se promueve al alias `@champion` si mejora (menor RMSE de validación) al champion vigente.
+
+Config vía variables de entorno: `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_NAME`, `MLFLOW_MODEL_NAME`.
+
+UI de MLflow disponible en **http://localhost:5000** (servicio `mlflow` en docker-compose, backend Postgres `mlflow_db`, artefactos en `./mlartifacts`).
+
+### 2) Scoring sobre producción
+
+`src/scoring.py` consume el modelo `@champion` (fallback a `models/best_model.pkl`) y procesa los batches de `data/prod/`:
+
+| Batch | Target | Anomalía intencional | Resultado esperado |
+|-------|--------|----------------------|--------------------|
+| `prod1` | sí | ninguna (datos sanos) | **OK** |
+| `prod2` | sí | target ×100 (coma decimal mal ubicada) | **ALERT** (performance) |
+| `prod3` | no | `bmi` ×1000 (sin decimal) | **ALERT** (drift de covariables) |
+
+Los targets se parsean con `decimal=','`. Las predicciones se guardan en la tabla `prod_predictions`.
+
+### 3) Monitoreo por batch
+
+`src/monitoring.py` calcula tres ejes y consolida el peor estado:
+
+- **Performance** (si hay target): RMSE/MAE/R²/MAPE; ratio vs baseline de validación. Umbrales: <1.25 OK, 1.25–2.0 WARNING, >2.0 ALERT.
+- **Drift**: PSI por feature vs `training_dataset`. Umbrales: <0.1 OK, 0.1–0.25 WARNING, ≥0.25 ALERT.
+- **Schema**: rangos numéricos y dominios categóricos. Umbrales: 0% OK, ≤5% WARNING, >5% ALERT.
+
+Salidas: tabla `monitoring_runs`, reportes `results/monitoring_report_*.json` y `.txt`, y un run de MLflow por batch.
+
+### 4) Revisar resultados
+
+```bash
+# MLflow UI
+# Abrir http://localhost:5000
+
+# Predicciones de producción
+docker compose exec postgres psql -U metlife_user -d metlife_db \
+  -c "SELECT batch, COUNT(*), AVG(predicted_charges) FROM prod_predictions GROUP BY batch;"
+
+# Estado de monitoreo por batch
+docker compose exec postgres psql -U metlife_user -d metlife_db \
+  -c "SELECT batch, status, rmse, rmse_ratio, max_psi, schema_violation_pct FROM monitoring_runs ORDER BY run_time DESC;"
+
+# Reporte legible
+cat results/monitoring_report_*.txt
+```
+
+### 5) Configuración Data Science (`config.yaml`)
+
+Parámetros de modelo, entrenamiento, promoción de champion y monitoreo están centralizados en [`config.yaml`](config.yaml) (plantilla: [`config.yaml.example`](config.yaml.example)).
+
+**Editar ahí (sin tocar código):**
+- `model.type`: `xgboost` o `sklearn_hist_gbm`
+- `promotion.metric` / `direction`: criterio de champion (ej. `validation_rmse`, `minimize`)
+- `promotion.block_if_overfitting` / `max_r2_diff`: bloquear promoción si hay overfitting (v1.1)
+- `training.hyperparam_search`: `n_iter`, `cv_folds`, `scoring`, grid de hiperparámetros
+- `training.feature_engineering.enabled`: activar/desactivar features compuestas (v1.1)
+- `monitoring.psi` / `performance` / `schema`: umbrales OK/WARNING/ALERT
+- `monitoring.enabled_axes`: ej. `[drift, schema, prediction_drift]` sin `performance` (v1.1)
+- `monitoring.psi.per_feature`: umbrales PSI por feature (v1.1)
+- `scoring.prod_batches_filter`: procesar solo algunos batches (v1.1)
+- `scoring.reference_sample_frac`: fracción del training para drift (v1.1)
+
+Secretos e infra (`DB_*`, `MLFLOW_TRACKING_URI`) siguen en `.env`. Variables `HYPERPARAM_ITERATIONS`, `CV_FOLDS`, `MLFLOW_*` pueden **override** valores del YAML.
+
+Tras editar `config.yaml`, reiniciar el pipeline: `docker compose up --build`.
+
+### 6) Dashboards en Grafana
+
+Al hacer `docker compose up` se levanta también un servicio **Grafana** (provisionado como código) conectado a Postgres.
+
+- URL: **http://localhost:3000** — usuario `admin`, contraseña `admin` (configurables vía `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD`).
+- Datasource Postgres y dashboards se cargan automáticamente desde `grafana/provisioning/` (carpeta `MetLife MLOps`).
+
+Tres dashboards:
+
+1. **Training data review** — análisis exploratorio genérico de `training_dataset` (distribuciones de `charges`/`age`/`bmi`, conteos categóricos, correlaciones, charges por categoría y scatter por `smoker`).
+2. **Training review** — selector de `run` (mismo nombre que MLflow, ej. `train_20260604_100848`): duración, dataset usado, métricas train/val, hiperparámetros, feature importances e historial de runs. Datos en la tabla `training_runs` (poblada por `training.py`).
+3. **Prod Predictions** — selector de `batch`: estado de monitoreo y comparaciones del batch vs baseline (features y predicciones) y predicciones vs target. Usa `prod_predictions`, `monitoring_runs` y `baseline_predictions`.
+
+Variable **Environment** (`sandbox` / `prod`) en los dashboards para filtrar filas por entorno MLOps.
+
+### 7) Sandbox y Producción (MLOps)
+
+- **Sandbox** (default): experiment `metlife_insurance`, registry `metlife_insurance_xgb` — sin cambio de nombres.
+- **Prod**: experiment `metlife_insurance_prod`, registry `metlife_insurance_xgb_prod` — ver [`config.prod.yaml`](config.prod.yaml).
+- Mismo pipeline (`training` + `scoring`); champion auto-promovido **dentro** de cada registry.
+- Promoción explícita Sandbox → Prod: `src/promote_sandbox_to_prod.py` (opcional `--run-scoring`).
+- Servicio Docker: `docker compose --profile prod run --rm ml_pipeline_prod`.
+
+Guía operativa: [`GUIDE.md`](GUIDE.md) sección 3.7.
+
+Las tablas extra (`training_runs`, `training_feature_importance`, `baseline_predictions`) las gestiona `src/grafana_utils.py` y **no alteran el flujo del pipeline** (escritura tolerante a fallos). Para validar las queries SQL de los dashboards:
+
+```bash
+docker compose up -d postgres
+python sql_test/run_tests.py
 ```
 
 ---

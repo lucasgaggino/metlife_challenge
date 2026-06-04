@@ -1,0 +1,114 @@
+# Copiar a config.yaml y ajustar. Misma estructura que config.yaml del repo.
+# Ver README seccion "Configuracion Data Science".
+# Entorno Prod: config.prod.yaml.example (merge con este archivo si ML_ENV=prod).
+
+environment: sandbox
+
+paths:
+  training_csv: data/dataset.csv
+  models_dir: models
+  results_dir: results
+  logs_dir: logs
+
+model:
+  type: xgboost
+  registry_name: metlife_insurance_xgb
+  champion_alias: champion
+
+promotion:
+  metric: validation_rmse
+  direction: minimize
+  split: validation
+  block_if_overfitting: false
+  max_r2_diff: 0.15
+
+training:
+  target_transform: log1p
+  test_size: 0.2
+  random_state_split: 43
+  random_state_model: 42
+  features:
+    raw: [age, sex, bmi, children, smoker, region]
+    numerical_engineered: [bmi_smoker, age_smoker, bmi_squared, age_squared, bmi_obese, age_senior]
+    categorical: [sex, smoker, region]
+  feature_engineering:
+    enabled:
+      bmi_smoker: true
+      age_smoker: true
+      bmi_squared: true
+      age_squared: true
+      bmi_obese: true
+      age_senior: true
+    bmi_obese_threshold: 30
+    age_senior_threshold: 50
+  hyperparam_search:
+    method: randomized
+    n_iter: 50
+    cv_folds: 5
+    scoring: neg_root_mean_squared_error
+    grid:
+      model__n_estimators: [100, 200, 300, 500]
+      model__max_depth: [3, 5, 7, 9]
+      model__learning_rate: [0.01, 0.05, 0.1, 0.2]
+      model__reg_alpha: [0, 0.1, 1]
+      model__reg_lambda: [1, 10, 100]
+  xgboost:
+    objective: reg:squarederror
+    n_jobs: -1
+    verbosity: 0
+  sklearn_hist_gbm:
+    max_iter: 300
+    max_depth: null
+    learning_rate: 0.1
+  overfitting_log:
+    minor_r2_diff: 0.05
+    moderate_r2_diff: 0.10
+    severe_r2_diff: 0.15
+    report_threshold: 0.10
+
+monitoring:
+  enabled_axes: [performance, drift, schema, prediction_drift]
+  psi:
+    warning: 0.10
+    alert: 0.25
+    n_bins: 10
+    epsilon: 1.0e-6
+    per_feature: {}
+  performance:
+    warning_ratio: 1.25
+    alert_ratio: 2.0
+  schema:
+    warning_pct: 0.0
+    alert_pct: 5.0
+    numeric_ranges:
+      age: [18, 100]
+      bmi: [10.0, 60.0]
+      children: [0, 10]
+    categorical_domains:
+      sex: ["male", "female"]
+      smoker: ["yes", "no"]
+      region: ["northeast", "northwest", "southeast", "southwest"]
+  drift:
+    numeric_features: [age, bmi, children]
+    categorical_features: [sex, smoker, region]
+
+scoring:
+  feature_columns: [age, sex, bmi, children, smoker, region]
+  reference_sample_frac: 1.0
+  prod_batches_filter: null
+  prod_batches:
+    - name: prod1
+      feats: data/prod/dataset_prod1_feats.csv.csv
+      target: data/prod/dataset_prod1_target.csv.csv
+    - name: prod2
+      feats: data/prod/dataset_prod2_feats.csv.csv
+      target: data/prod/dataset_prod2_target.csv.csv
+    - name: prod3
+      feats: data/prod/dataset_prod3_feats.csv.csv
+      target: null
+
+mlflow:
+  experiment_name: metlife_insurance
+
+logging:
+  level: INFO

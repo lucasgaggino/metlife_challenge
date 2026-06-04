@@ -1,0 +1,15 @@
+# Overrides de entorno Prod (merge sobre config.yaml cuando ML_ENV=prod).
+# MLflow sandbox no se renombra; aqui solo entidades _prod.
+
+environment: prod
+
+paths:
+  models_dir: models/prod
+  results_dir: results/prod
+  logs_dir: logs/prod
+
+model:
+  registry_name: metlife_insurance_xgb_prod
+
+mlflow:
+  experiment_name: metlife_insurance_prod

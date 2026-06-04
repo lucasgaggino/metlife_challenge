@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:15-alpine
@@ -27,6 +25,43 @@ services:
     networks:
       - metlife_network
 
+  # MLflow Tracking Server
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+
+    container_name: metlife_mlflow
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      MLFLOW_DB_HOST: postgres
+      MLFLOW_DB_PORT: 5432
+      MLFLOW_DB_USER: ${DB_USER:-metlife_user}
+      MLFLOW_DB_PASSWORD: ${DB_PASSWORD:-metlife_pass}
+      MLFLOW_DB_NAME: ${MLFLOW_DB_NAME:-mlflow_db}
+      MLFLOW_ARTIFACTS_DIR: /mlartifacts
+
+    ports:
+      - "5000:5000"
+
+    volumes:
+      - ./mlartifacts:/mlartifacts
+
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+    networks:
+      - metlife_network
+
 # ML Pipeline
   ml_pipeline:
     build:
@@ -39,6 +74,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      mlflow:
+        condition: service_healthy
 
     environment:
       # Database config
@@ -48,24 +85,114 @@ services:
       DB_USER: ${DB_USER:-metlife_user}
       DB_PASSWORD: ${DB_PASSWORD:-metlife_pass}
 
+      # Entorno MLOps (sandbox = comportamiento historico del challenge)
+      ML_ENV: ${ML_ENV:-sandbox}
+
       # ML config
+      CONFIG_PATH: /app/config.yaml
       PYTHONUNBUFFERED: 1
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       HYPERPARAM_ITERATIONS: ${HYPERPARAM_ITERATIONS:-50}
       CV_FOLDS: ${CV_FOLDS:-5}
       SCORING_SAMPLE_SIZE: ${SCORING_SAMPLE_SIZE:-10}
 
+      # MLflow config
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-metlife_insurance}
+      MLFLOW_MODEL_NAME: ${MLFLOW_MODEL_NAME:-metlife_insurance_xgb}
+
     volumes:
       # Persistir outputs
       - ./models:/app/models
       - ./results:/app/results
       - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
+      - ./config.prod.yaml:/app/config.prod.yaml:ro
+
+    networks:
+      - metlife_network
+
+  # Pipeline en entorno Prod (profile prod): MLflow experiment/registry _prod
+  ml_pipeline_prod:
+    profiles: ["prod"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: metlife_ml_pipeline_prod
+    restart: on-failure
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+
+    environment:
+      DB_HOST: postgres
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-metlife_db}
+      DB_USER: ${DB_USER:-metlife_user}
+      DB_PASSWORD: ${DB_PASSWORD:-metlife_pass}
+
+      ML_ENV: prod
+      CONFIG_PATH: /app/config.prod.yaml
+      PYTHONUNBUFFERED: 1
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      HYPERPARAM_ITERATIONS: ${HYPERPARAM_ITERATIONS:-50}
+      CV_FOLDS: ${CV_FOLDS:-5}
+      SCORING_SAMPLE_SIZE: ${SCORING_SAMPLE_SIZE:-10}
+
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_EXPERIMENT_NAME: metlife_insurance_prod
+      MLFLOW_MODEL_NAME: metlife_insurance_xgb_prod
+
+    volumes:
+      - ./models/prod:/app/models/prod
+      - ./results/prod:/app/results/prod
+      - ./logs/prod:/app/logs/prod
+      - ./config.yaml:/app/config.yaml:ro
+      - ./config.prod.yaml:/app/config.prod.yaml:ro
+
+    networks:
+      - metlife_network
+
+  # Grafana: dashboards de analisis (lee de Postgres)
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: metlife_grafana
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Datasource de Postgres (usado por el provisioning)
+      GRAFANA_DB_HOST: postgres
+      GRAFANA_DB_PORT: 5432
+      GRAFANA_DB_NAME: ${DB_NAME:-metlife_db}
+      GRAFANA_DB_USER: ${DB_USER:-metlife_user}
+      GRAFANA_DB_PASSWORD: ${DB_PASSWORD:-metlife_pass}
+
+    ports:
+      - "3000:3000"
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
 
     networks:
       - metlife_network
 
 volumes:
   postgres_data:
+    driver: local
+  grafana_data:
     driver: local
 
 networks:

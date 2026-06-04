@@ -1,0 +1,18 @@
+FROM python:3.10-slim
+
+LABEL maintainer="Lucas Gaggino <lucas.gaggino@gmail.com>" \
+      description="MLflow Tracking Server - MetLife MLOps Challenge"
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir mlflow==2.22.5 psycopg2-binary==2.9.9
+
+COPY mlflow_entrypoint.sh /app/mlflow_entrypoint.sh
+RUN sed -i 's/\r$//' /app/mlflow_entrypoint.sh && chmod +x /app/mlflow_entrypoint.sh
+
+EXPOSE 5000
+
+ENTRYPOINT ["/app/mlflow_entrypoint.sh"]

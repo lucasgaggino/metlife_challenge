@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 FROM python:3.10-slim
 
 #Metadata
-LABEL maintainer="jm.aragonpaz@gmail.com" \
+LABEL maintainer="Lucas Gaggino <lucas.gaggino@gmail.com>" \
       description="ML Engineering Challenge - MetLife" \
       version="1.0"
 
@@ -36,6 +36,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     libpq5 \
     postgresql-client \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 #Copio entorno virtual desde builder
@@ -47,7 +48,8 @@ COPY data/ /app/data/
 COPY entrypoint.sh .
 
 # Crear usuario no-root (seguridad)
-RUN groupadd -r appuser && \
+RUN sed -i 's/\r$//' entrypoint.sh && \
+    groupadd -r appuser && \
     useradd -r -g appuser appuser && \
     chown -R appuser:appuser /app && \
     chmod +x entrypoint.sh

@@ -199,6 +199,7 @@ cython_debug/
 #  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
+.cursor/
 .cursorindexingignore
 
 # Marimo
@@ -209,5 +210,14 @@ __marimo__/
 *.pkl
 *.json
 *.txt
+
+# MLflow artifacts / local store
+mlartifacts/
+mlruns/
+
+# Artefactos del entorno Prod MLOps
+models/prod/
+results/prod/
+logs/prod/
 
 *.DS_Store

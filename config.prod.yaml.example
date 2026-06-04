@@ -1,0 +1,14 @@
+# Copiar a config.prod.yaml. Overrides de Prod (merge con config.yaml si ML_ENV=prod).
+
+environment: prod
+
+paths:
+  models_dir: models/prod
+  results_dir: results/prod
+  logs_dir: logs/prod
+
+model:
+  registry_name: metlife_insurance_xgb_prod
+
+mlflow:
+  experiment_name: metlife_insurance_prod

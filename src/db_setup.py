@@ -4,6 +4,9 @@ import logging
 import os
 import sys
 
+import grafana_utils
+from config_loader import get_environment, get_paths, log_config_summary
+
 # Setup de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -32,15 +35,74 @@ def connect_to_db():
         logger.error(f"Error al conectar a la base de datos: {e}")
         raise
 
-def drop_tables(engine):
-    """Elimina tablas existentes (para fresh start)."""
-    logger.info("Eliminando tablas existentes (si existen)...")
+def _table_exists(conn, table_name: str) -> bool:
+    r = conn.execute(
+        text("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = :t
+            )
+        """),
+        {'t': table_name},
+    )
+    return bool(r.scalar())
+
+
+def migrate_environment_columns(engine):
+    """Añade columna environment a tablas existentes (idempotente)."""
+    tables = (
+        'prod_predictions',
+        'monitoring_runs',
+        'training_runs',
+        'training_feature_importance',
+        'baseline_predictions',
+    )
     with engine.connect() as conn:
+        for table in tables:
+            if not _table_exists(conn, table):
+                continue
+            conn.execute(text(f"""
+                ALTER TABLE {table}
+                ADD COLUMN IF NOT EXISTS environment VARCHAR(10) NOT NULL DEFAULT 'sandbox'
+            """))
+        if _table_exists(conn, 'training_runs'):
+            try:
+                conn.execute(text(
+                    "ALTER TABLE training_runs DROP CONSTRAINT IF EXISTS training_runs_run_name_key"
+                ))
+                conn.execute(text(
+                    "ALTER TABLE training_runs DROP CONSTRAINT IF EXISTS training_runs_env_run_name_key"
+                ))
+                conn.execute(text("""
+                    ALTER TABLE training_runs
+                    ADD CONSTRAINT training_runs_env_run_name_key
+                    UNIQUE (environment, run_name)
+                """))
+            except Exception as e:
+                logger.warning(f"No se pudo actualizar UNIQUE de training_runs: {e}")
+        conn.commit()
+    logger.info("Migracion de columna 'environment' verificada.")
+
+
+def drop_tables(engine, environment=None):
+    """Limpia datos del entorno activo sin borrar el otro entorno."""
+    if environment is None:
+        environment = get_environment()
+    logger.info(f"Limpiando tablas para environment='{environment}'...")
+    migrate_environment_columns(engine)
+    with engine.connect() as conn:
+        for table in ('prod_predictions', 'monitoring_runs'):
+            if _table_exists(conn, table):
+                conn.execute(
+                    text(f"DELETE FROM {table} WHERE environment = :env"),
+                    {'env': environment},
+                )
+        if environment == 'sandbox':
+            conn.execute(text("DROP TABLE IF EXISTS training_dataset CASCADE;"))
         conn.execute(text("DROP TABLE IF EXISTS predictions CASCADE;"))
         conn.execute(text("DROP TABLE IF EXISTS scoring_dataset CASCADE;"))
-        conn.execute(text("DROP TABLE IF EXISTS training_dataset CASCADE;"))
         conn.commit()
-    logger.info("Tablas eliminadas.")
+    logger.info(f"Limpieza completada para environment='{environment}'.")
 
 def create_tables(engine):
     """Crea tanlas necesarias para el proyecto."""
@@ -67,7 +129,9 @@ def create_tables(engine):
         logger.info("Tabla 'training_dataset' creada.")
         
 
-def load_dataset(engine, csv_path='data/dataset.csv'):
+def load_dataset(engine, csv_path=None):
+    if csv_path is None:
+        csv_path = get_paths().get('training_csv', 'data/dataset.csv')
     """Carga el dataset desde un CSV a la tabla"""
     
     logger.info(f"Cargando dataset desde {csv_path}...")
@@ -135,42 +199,86 @@ def load_dataset(engine, csv_path='data/dataset.csv'):
             logger.info(f"{dict(row)}")
 
 def create_additional_tables(engine):
-    """Crea tablas addicionales para scoring y predicciones"""
-    
+    """Crea tablas addicionales para scoring y predicciones (con environment)."""
     with engine.connect() as conn:
-        
-        create_predictions_table = text("""
-            CREATE TABLE predictions (
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS prod_predictions (
                 id SERIAL PRIMARY KEY,
-                scoring_id INTEGER NOT NULL,
-                age INTEGER NOT NULL,
-                sex VARCHAR(10) NOT NULL,
-                bmi FLOAT NOT NULL,
-                children INTEGER NOT NULL,
-                smoker VARCHAR(5) NOT NULL,
-                region VARCHAR(20) NOT NULL,
+                environment VARCHAR(10) NOT NULL DEFAULT 'sandbox',
+                batch VARCHAR(50) NOT NULL,
+                row_id INTEGER NOT NULL,
+                age INTEGER,
+                sex VARCHAR(10),
+                bmi FLOAT,
+                children INTEGER,
+                smoker VARCHAR(5),
+                region VARCHAR(20),
                 actual_charges FLOAT,
                 predicted_charges FLOAT,
                 absolute_error FLOAT,
                 percentage_error FLOAT,
                 prediction_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
-        
-        conn.execute(create_predictions_table)
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS monitoring_runs (
+                id SERIAL PRIMARY KEY,
+                environment VARCHAR(10) NOT NULL DEFAULT 'sandbox',
+                batch VARCHAR(50) NOT NULL,
+                status VARCHAR(10) NOT NULL,
+                n_rows INTEGER,
+                rmse FLOAT,
+                mae FLOAT,
+                r2 FLOAT,
+                mape FLOAT,
+                rmse_ratio FLOAT,
+                max_psi FLOAT,
+                prediction_psi FLOAT,
+                schema_violation_pct FLOAT,
+                performance_status VARCHAR(10),
+                drift_status VARCHAR(10),
+                prediction_drift_status VARCHAR(10),
+                schema_status VARCHAR(10),
+                has_target BOOLEAN,
+                run_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
         conn.commit()
-        logger.info("Tabla 'predictions' creada.")
+    migrate_environment_columns(engine)
+    logger.info("Tablas 'prod_predictions' y 'monitoring_runs' verificadas.")
+
+def ensure_training_dataset(engine):
+    """Crea training_dataset si no existe (entorno prod sin recargar CSV)."""
+    with engine.connect() as conn:
+        r = conn.execute(text("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'training_dataset'
+            )
+        """))
+        if r.scalar():
+            logger.info("Tabla 'training_dataset' ya existe; se conserva.")
+            return
+    create_tables(engine)
+    load_dataset(engine)
+
 
 def main():
     """Pipeline principal para setup de la base de datos."""
     
     try:
-        logger.info("Iniciando setup de la base de datos...")
+        env = get_environment()
+        logger.info(f"Iniciando setup de la base de datos (environment={env})...")
+        log_config_summary()
         engine = connect_to_db()
-        drop_tables(engine)
-        create_tables(engine)
-        load_dataset(engine)
+        drop_tables(engine, env)
+        if env == 'sandbox':
+            create_tables(engine)
+            load_dataset(engine)
+        else:
+            ensure_training_dataset(engine)
         create_additional_tables(engine)
+        grafana_utils.create_grafana_tables(engine)
         logger.info("Setup de la base de datos completado exitosamente.")
         return True
     

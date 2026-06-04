@@ -80,6 +80,29 @@ wait_for_postgres() {
     log_success "PostgreSQL está listo!"
 }
 
+wait_for_mlflow() {
+    local tracking_uri="${MLFLOW_TRACKING_URI:-http://mlflow:5000}"
+    log_info "Esperando a que MLflow esté listo en $tracking_uri ..."
+
+    local max_retries=30
+    local retry_count=0
+    local wait_seconds=2
+
+    until curl -sf "${tracking_uri}/health" >/dev/null 2>&1; do
+        retry_count=$((retry_count + 1))
+
+        if [ $retry_count -ge $max_retries ]; then
+            log_error "MLflow no disponible después de $max_retries intentos"
+            exit 1
+        fi
+
+        log_warn "Intento $retry_count/$max_retries - MLflow aún no está listo"
+        sleep $wait_seconds
+    done
+
+    log_success "MLflow está listo!"
+}
+
 run_python_script() {
     local script_name=$1
     local script_path="src/$script_name"
@@ -106,6 +129,8 @@ run_python_script() {
 
 log_info "Iniciando ML Pipeline"
 log_info "Configuración:"
+log_info "  ML Environment: ${ML_ENV:-sandbox}"
+log_info "  Config path: ${CONFIG_PATH:-/app/config.yaml}"
 log_info "  DB Host: $DB_HOST"
 log_info "  DB Name: $DB_NAME"
 log_info "  DB User: $DB_USER"
@@ -116,6 +141,9 @@ log_info "  Scoring Sample Size: ${SCORING_SAMPLE_SIZE:-10}"
 
 # 1. Wait for PostgreSQL
 wait_for_postgres
+
+# 1b. Wait for MLflow
+wait_for_mlflow
 
 # 2. Database Setup
 if ! run_python_script "db_setup.py"; then

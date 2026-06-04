@@ -12,9 +12,24 @@ import logging
 import os
 import sys
 import json
+import time
 from datetime import datetime
 from utils import get_db_engine, feature_engineering, transform_target
+import grafana_utils
+from config_loader import (
+    get_config, get_training_cfg, get_model_cfg, get_paths, get_mlflow_cfg,
+    get_promotion_cfg, numerical_features_for_training, categorical_features_for_training,
+    resolve_promotion_metric_value, is_promotion_better, log_config_summary,
+)
 import shutil
+# Evita el warning de MLflow al no encontrar git (no usamos git SHA en los runs)
+os.environ.setdefault('GIT_PYTHON_REFRESH', 'quiet')
+import mlflow
+import mlflow.sklearn
+from mlflow.tracking import MlflowClient
+
+def _champion_alias():
+    return get_model_cfg().get('champion_alias', 'champion')
 # Setup de logging
 logging.basicConfig(
     level=logging.INFO,
@@ -86,12 +101,8 @@ def split_data(X, y_transformed, y_original, test_size=0.2, random_state=43):
 
 def create_preprocessor():
     """Pipeline de preprocesamiento de features"""
-    categorical_features = ['sex', 'smoker', 'region']
-    numerical_features = ['age', 'bmi', 'children',
-                        'bmi_smoker', 'age_smoker',
-                        'bmi_squared', 'age_squared',
-                        'bmi_obese', 'age_senior'
-                        ]
+    categorical_features = categorical_features_for_training()
+    numerical_features = numerical_features_for_training()
     
     preprocessor= ColumnTransformer(
         transformers=[
@@ -108,21 +119,16 @@ def create_preprocessor():
     return preprocessor
 
 def define_hyperparameter_grid():
-    """Grid de hiperparámetros para XGBoost"""
-
-    param_distributions = {
-        'model__n_estimators': [100, 200, 300, 500],
-        'model__max_depth': [3, 5, 7, 9],
-        'model__learning_rate': [0.01, 0.05, 0.1, 0.2],
-        # Estos los agrego despues para no tener un tiempo de entrenamiento tan largo
-        # y en funcion de los resultados que vaya obteniendo con el grid inicial
-        # 'model__subsample': [0.7, 0.8, 0.9, 1.0],
-        # 'model__colsample_bytree': [0.7, 0.8, 0.9, 1.0],
-        # 'model__min_child_weight': [1, 3, 5],
-        # 'model__gamma': [0, 0.1, 0.2],
-        'model__reg_alpha': [0, 0.1, 1],  # L1 regularization
-        'model__reg_lambda': [1, 10, 100],  # L2 regularization
-    }
+    """Grid de hiperparametros desde config.yaml"""
+    param_distributions = dict(get_training_cfg().get('hyperparam_search', {}).get('grid', {}))
+    if not param_distributions:
+        param_distributions = {
+            'model__n_estimators': [100, 200, 300, 500],
+            'model__max_depth': [3, 5, 7, 9],
+            'model__learning_rate': [0.01, 0.05, 0.1, 0.2],
+            'model__reg_alpha': [0, 0.1, 1],
+            'model__reg_lambda': [1, 10, 100],
+        }
 
     total_combinations = np.prod([len(v) for v in param_distributions.values()])
     logger.info(f"Hyperparameter grid definido:")
@@ -131,42 +137,70 @@ def define_hyperparameter_grid():
 
     return param_distributions
 
+
+def create_estimator():
+    """Factory de estimador segun model.type en config (xgboost | sklearn_hist_gbm)."""
+    tcfg = get_training_cfg()
+    mtype = get_model_cfg().get('type', 'xgboost').lower()
+    rs = int(tcfg.get('random_state_model', 42))
+
+    if mtype == 'sklearn_hist_gbm':
+        from sklearn.ensemble import HistGradientBoostingRegressor
+        gbm = tcfg.get('sklearn_hist_gbm', {})
+        kwargs = {
+            'max_iter': int(gbm.get('max_iter', 300)),
+            'learning_rate': float(gbm.get('learning_rate', 0.1)),
+            'random_state': rs,
+        }
+        if gbm.get('max_depth') is not None:
+            kwargs['max_depth'] = int(gbm['max_depth'])
+        logger.info("Estimador: HistGradientBoostingRegressor")
+        return HistGradientBoostingRegressor(**kwargs)
+
+    xgb_cfg = tcfg.get('xgboost', {})
+    logger.info("Estimador: XGBRegressor")
+    return xgb.XGBRegressor(
+        objective=xgb_cfg.get('objective', 'reg:squarederror'),
+        random_state=rs,
+        n_jobs=int(xgb_cfg.get('n_jobs', -1)),
+        verbosity=int(xgb_cfg.get('verbosity', 0)),
+    )
+
+
 def train_model(X_train, y_train):
     """Entrenamiento del modelo con RandomizedSearchCV"""
 
     logger.info("Iniciando entrenamiento del modelo con RandomizedSearchCV...")
-    
-    preprocessor= create_preprocessor()
-    model=xgb.XGBRegressor(
-        objective='reg:squarederror',
-        random_state=42,
-        n_jobs=-1,
-        verbosity=0
-        )
-    
+
+    preprocessor = create_preprocessor()
+    model = create_estimator()
+
     pipeline = Pipeline([
         ('preprocessor', preprocessor),
         ('model', model)
     ])
-    
-    param_grid= define_hyperparameter_grid()
-    n_iter=int(os.getenv('HIPERPARAM_ITERATIONS', 350))
-    cv_folds=int(os.getenv('CV_FOLDS', 5))
-    
+
+    hp = get_training_cfg().get('hyperparam_search', {})
+    param_grid = define_hyperparameter_grid()
+    n_iter = int(hp.get('n_iter', 50))
+    cv_folds = int(hp.get('cv_folds', 5))
+    scoring = hp.get('scoring', 'neg_root_mean_squared_error')
+    rs = int(get_training_cfg().get('random_state_model', 42))
+
     logger.info(f"Configuracion de busqueda:")
     logger.info(f"  - Metodo: RandomizedSearchCV")
     logger.info(f"  - Iteraciones: {n_iter}")
     logger.info(f"  - Cross-validation folds: {cv_folds}")
-    logger.info(f"  - Scoring metric: neg_root_mean_squared_error")
+    logger.info(f"  - Scoring metric: {scoring}")
 
     random_search = RandomizedSearchCV(
         pipeline,
         param_distributions=param_grid,
         n_iter=n_iter,
         cv=cv_folds,
-        scoring='neg_root_mean_squared_error',
+        scoring=scoring,
         n_jobs=-1,
-        random_state=42,
+        random_state=rs,
         verbose=2,
         return_train_score=True,
         refit=True
@@ -257,11 +291,15 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, y_train_original, y_va
     logger.info(f" OVERFITTING ANALYSIS:")
     logger.info(f"  R² difference (train - val): {r2_diff:.4f}")
 
-    if r2_diff > 0.15:
+    of_cfg = get_training_cfg().get('overfitting_log', {})
+    severe = float(of_cfg.get('severe_r2_diff', 0.15))
+    moderate = float(of_cfg.get('moderate_r2_diff', 0.10))
+    minor = float(of_cfg.get('minor_r2_diff', 0.05))
+    if r2_diff > severe:
         logger.warning("SEVERE overfitting detected!")
-    elif r2_diff > 0.10:
+    elif r2_diff > moderate:
         logger.warning("Moderate overfitting detected")
-    elif r2_diff > 0.05:
+    elif r2_diff > minor:
         logger.info("Minor overfitting (acceptable)")
     else:
         logger.info("No significant overfitting")
@@ -273,7 +311,9 @@ def evaluate_model(model, X_train, y_train, X_val, y_val, y_train_original, y_va
     }, y_val_pred
     
     
-def save_model(model, metrics, best_params, output_dir='models'):
+def save_model(model, metrics, best_params, output_dir=None):
+    if output_dir is None:
+        output_dir = get_paths().get('models_dir', 'models')
     """Guarda modelo y metadata de los mismos"""
     
     logger.info("Guardando modelo y metadata...")
@@ -290,7 +330,7 @@ def save_model(model, metrics, best_params, output_dir='models'):
     #Guardo metadata
     metadata = {
         'timestamp': timestamp,
-        'model_type': 'XGBoostRegressor',
+        'model_type': get_model_cfg().get('type', 'xgboost'),
         'best_params': best_params,
         'train_metrics': metrics['train'],
         'validation_metrics': metrics['validation'],
@@ -313,7 +353,9 @@ def save_model(model, metrics, best_params, output_dir='models'):
     
     return model_path
 
-def generate_report(metrics, best_params, search_results, output_dir='results'):
+def generate_report(metrics, best_params, search_results, output_dir=None):
+    if output_dir is None:
+        output_dir = get_paths().get('results_dir', 'results')
     """Generar reporte de evaluacion del modelo"""
     
     logger.info("Generando reporte de evaluación...")
@@ -366,7 +408,8 @@ def generate_report(metrics, best_params, search_results, output_dir='results'):
         f.write(f"Error porcentual medio (MAPE) de {metrics['validation']['mape']:.2f}% \n\n")
         
         overfitting = metrics['overfitting_score']
-        if overfitting > 0.1:
+        report_thr = float(get_training_cfg().get('overfitting_log', {}).get('report_threshold', 0.1))
+        if overfitting > report_thr:
             f.write(f"Se detecta un posible overfitting (R² train - R² val = {overfitting:.4f}).\n")
             f.write(f"Considerar técnicas de regularización o más datos para mejorar generalización.\n")
         else:
@@ -395,11 +438,135 @@ def generate_report(metrics, best_params, search_results, output_dir='results'):
     logger.info(f"Reporte generado en: {report_path}")
     return report_path
 
+def setup_mlflow():
+    """Configura MLflow desde config.yaml + env overrides."""
+    mlf = get_mlflow_cfg()
+    mlflow.set_tracking_uri(mlf['tracking_uri'])
+    mlflow.set_experiment(mlf['experiment_name'])
+    logger.info(f"MLflow configurado:")
+    logger.info(f"  - Tracking URI: {mlf['tracking_uri']}")
+    logger.info(f"  - Experimento: {mlf['experiment_name']}")
+    logger.info(f"  - Model name: {mlf['model_name']}")
+    return mlf['tracking_uri'], mlf['experiment_name']
+
+def log_training_to_mlflow(best_model, metrics, random_search, report_path, model_dir=None):
+    if model_dir is None:
+        model_dir = get_paths().get('models_dir', 'models')
+    """Loguea params, metricas y artefactos del entrenamiento en MLflow y registra el modelo.
+
+    Devuelve el ModelVersion registrado (o None si falla el registro).
+    """
+    model_name = get_mlflow_cfg()['model_name']
+    tcfg = get_training_cfg()
+
+    params = {k.replace('model__', ''): v for k, v in random_search.best_params_.items()}
+    params.update({
+        'n_iter': random_search.n_iter,
+        'cv_folds': random_search.cv,
+        'random_state_split': tcfg.get('random_state_split', 43),
+        'random_state_model': tcfg.get('random_state_model', 42),
+        'test_size': tcfg.get('test_size', 0.2),
+        'target_transform': tcfg.get('target_transform', 'log1p'),
+        'model_type': get_model_cfg().get('type', 'xgboost'),
+        'numerical_features': ",".join(numerical_features_for_training()),
+        'categorical_features': ",".join(categorical_features_for_training()),
+        'search_scoring': random_search.scoring,
+        'promotion_metric': get_promotion_cfg().get('metric'),
+    })
+    mlflow.log_params(params)
+
+    # Metricas train/val en escala original ($) y diagnostico log
+    for split_name in ('train', 'validation'):
+        for metric_name, value in metrics[split_name].items():
+            mlflow.log_metric(f"{split_name}_{metric_name}", float(value))
+    mlflow.log_metric('overfitting_score', float(metrics['overfitting_score']))
+    mlflow.log_metric('cv_best_rmse', float(-random_search.best_score_))
+
+    # Artefactos: reporte y metadata local
+    if report_path and os.path.exists(report_path):
+        mlflow.log_artifact(report_path, artifact_path='reports')
+    metadata_local = os.path.join(model_dir, 'best_model_metadata.json')
+    if os.path.exists(metadata_local):
+        mlflow.log_artifact(metadata_local, artifact_path='metadata')
+
+    # Modelo + registro en Model Registry
+    input_example = None
+    try:
+        mlflow.sklearn.log_model(
+            sk_model=best_model,
+            artifact_path='model',
+            registered_model_name=model_name,
+            input_example=input_example,
+        )
+        logger.info(f"Modelo logueado y registrado en MLflow como '{model_name}'.")
+    except Exception as e:
+        logger.warning(f"No se pudo registrar el modelo en MLflow Registry: {e}")
+        return None
+
+    # Recuperar la ultima version registrada para este run
+    client = MlflowClient()
+    run_id = mlflow.active_run().info.run_id
+    versions = client.search_model_versions(f"name='{model_name}'")
+    this_version = None
+    for v in versions:
+        if v.run_id == run_id:
+            this_version = v
+            break
+    return this_version
+
+def promote_if_better(model_version, metrics):
+    """Promueve a champion si mejora la metrica configurada (promotion.metric / direction)."""
+    if model_version is None:
+        logger.warning("Sin version registrada; se omite promocion.")
+        return False
+
+    prom = get_promotion_cfg()
+    alias = _champion_alias()
+    metric_key = prom.get('metric', 'validation_rmse')
+
+    if prom.get('block_if_overfitting') and metrics.get('overfitting_score', 0) > float(prom.get('max_r2_diff', 0.15)):
+        logger.warning(
+            f"Promocion bloqueada: overfitting_score={metrics['overfitting_score']:.4f} > "
+            f"max_r2_diff={prom.get('max_r2_diff')}"
+        )
+        return False
+
+    new_val = resolve_promotion_metric_value(metrics)
+    if new_val is None:
+        logger.warning(f"No se pudo resolver metrica de promocion '{metric_key}'.")
+        return False
+
+    model_name = model_version.name
+    client = MlflowClient()
+    current_val = None
+    try:
+        champion = client.get_model_version_by_alias(model_name, alias)
+        run = client.get_run(champion.run_id)
+        current_val = run.data.metrics.get(metric_key)
+        logger.info(f"Champion actual: v{champion.version} ({metric_key}={current_val})")
+    except Exception:
+        logger.info("No existe champion previo; se promovera este modelo.")
+
+    if is_promotion_better(new_val, current_val):
+        client.set_registered_model_alias(model_name, alias, model_version.version)
+        logger.info(f"Modelo v{model_version.version} promovido a '@{alias}' ({metric_key}={new_val}).")
+        return True
+
+    logger.info(
+        f"Modelo v{model_version.version} ({metric_key}={new_val}) NO supera al champion "
+        f"({metric_key}={current_val}); se mantiene el champion actual."
+    )
+    return False
+
 def main():
     """Función principal para ejecutar el proceso de entrenamiento."""
     
     try:
         logger.info("Iniciando proceso de entrenamiento...")
+        log_config_summary()
+
+        # Paso 0: Configurar MLflow
+        setup_mlflow()
 
         # Paso 1: Conectar a la base de datos
         engine = get_db_engine()
@@ -407,46 +574,76 @@ def main():
         # Paso 2: Cargar datos de entrenamiento
         df = load_training_data(engine)
         logger.info("Proceso de entrenamiento completado.")
-        
-        # Paso 3: Preparar features y target
-        logger.info("Preparando features y target...")
-        X, y_transformed, y_original = prepare_features_target(df)
-        
-        # Paso 4: Split train/validation
-        logger.info("Dividiendo datos en train y validation...")
-        X_train, X_val, y_train, y_val, y_train_orig, y_val_orig = split_data(X, y_transformed, y_original, test_size=0.2, random_state=43)
-        
-        # Paso 5 beta
-        preprocessor= create_preprocessor()
-        param_distributions = define_hyperparameter_grid()
-        
-        #Paso 5: Entrenar modelo con RandomizedSearchCV
-        logger.info("Entrenando modelo con RandomizedSearchCV...")
-        best_model,random_search = train_model(X_train, y_train)
-        
-        # Paso 6: Evaluar modelo
-        logger.info("Evaluando modelo en el set de validación...")
-        metrics, y_val_pred = evaluate_model(best_model, X_train, y_train, X_val, y_val, y_train_orig, y_val_orig)
-        
-        # Paso 7: Guardar modelo y metadata y estadisticas de training
-        logger.info("Guardando modelo y metadata...")
-        model_path = save_model(best_model, metrics, random_search.best_params_)
 
-        # Paso 8: Generar reportede evaluacion
-        report_path = generate_report(metrics, random_search.best_params_, random_search)
+        run_name = f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        with mlflow.start_run(run_name=run_name) as run:
+            mlflow.set_tag('stage', 'training')
+            started_at = datetime.now()
+            t0 = time.time()
 
-        logger.info("\n" + "="*70)
-        logger.info("TRAINING PIPELINE COMPLETADO EXITOSAMENTE")
-        logger.info("="*70)
-        logger.info(f"\nModelo guardado en: {model_path}")
-        logger.info(f"Reporte generado en: {report_path}")
-        logger.info(f"\nValidation R²: {metrics['validation']['r2']:.4f}")
-        logger.info(f"Validation RMSE: ${metrics['validation']['rmse']:,.2f}")
+            # Paso 3: Preparar features y target
+            logger.info("Preparando features y target...")
+            X, y_transformed, y_original = prepare_features_target(df)
 
-        
+            # Paso 4: Split train/validation
+            logger.info("Dividiendo datos en train y validation...")
+            tcfg = get_training_cfg()
+            X_train, X_val, y_train, y_val, y_train_orig, y_val_orig = split_data(
+                X, y_transformed, y_original,
+                test_size=float(tcfg.get('test_size', 0.2)),
+                random_state=int(tcfg.get('random_state_split', 43)),
+            )
+
+            # Paso 5: Entrenar modelo con RandomizedSearchCV
+            logger.info("Entrenando modelo con RandomizedSearchCV...")
+            best_model, random_search = train_model(X_train, y_train)
+
+            # Paso 6: Evaluar modelo
+            logger.info("Evaluando modelo en el set de validación...")
+            metrics, y_val_pred = evaluate_model(best_model, X_train, y_train, X_val, y_val, y_train_orig, y_val_orig)
+
+            # Paso 7: Guardar modelo y metadata y estadisticas de training
+            logger.info("Guardando modelo y metadata...")
+            model_path = save_model(best_model, metrics, random_search.best_params_)
+
+            # Paso 8: Generar reporte de evaluacion
+            report_path = generate_report(metrics, random_search.best_params_, random_search)
+
+            # Paso 9: Loguear en MLflow y registrar modelo
+            logger.info("Logueando entrenamiento en MLflow y registrando modelo...")
+            model_version = log_training_to_mlflow(best_model, metrics, random_search, report_path)
+
+            # Paso 10: Promover a champion si mejora el RMSE de validacion
+            is_champion = promote_if_better(model_version, metrics)
+
+            # Paso 11: Persistir el run para Grafana (no aborta el pipeline si falla)
+            grafana_utils.save_training_run(
+                engine=engine,
+                run_name=run_name,
+                mlflow_run_id=run.info.run_id,
+                model_version=model_version,
+                is_champion=is_champion,
+                df=df,
+                metrics=metrics,
+                random_search=random_search,
+                best_model=best_model,
+                duration_seconds=time.time() - t0,
+                started_at=started_at,
+                finished_at=datetime.now(),
+            )
+
+            logger.info("\n" + "="*70)
+            logger.info("TRAINING PIPELINE COMPLETADO EXITOSAMENTE")
+            logger.info("="*70)
+            logger.info(f"\nMLflow run_id: {run.info.run_id}")
+            logger.info(f"Modelo guardado en: {model_path}")
+            logger.info(f"Reporte generado en: {report_path}")
+            logger.info(f"\nValidation R²: {metrics['validation']['r2']:.4f}")
+            logger.info(f"Validation RMSE: ${metrics['validation']['rmse']:,.2f}")
+
         return True
-    
-    
+
+
     except Exception as e:
         logger.error(f"\nError en el proceso de entrenamiento: {str(e)}", exc_info=True)
         sys.exit(1)
