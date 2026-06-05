@@ -158,6 +158,44 @@ En Grafana, usá la variable **Environment** (`sandbox` / `prod`) en los dashboa
 
 **Nota:** los batches `prod1`/`prod2`/`prod3` en `data/prod/` son datos de scoring del challenge; no son el entorno MLOps Prod.
 
+### 3.8 Modo online (simulación productiva v1)
+
+Simula requests **sin target** muestreando features de `data/dataset.csv`, a tasa configurable (default **10 req/s**, **1200** requests). Usa el champion del entorno activo y guarda en `online_predictions` (sin `actual_charges`). En MLflow: **1 run por sesión** (`stage=online`).
+
+**Requisito:** haber corrido `scoring.py` antes en el mismo entorno (para `baseline_predictions`).
+
+```bash
+# Sandbox (~2 min con defaults en config.yaml)
+docker compose run --rm --entrypoint python ml_pipeline src/online_scoring.py
+
+# Profile online
+docker compose --profile online run --rm ml_pipeline_online
+
+# Prod
+docker compose run --rm -e ML_ENV=prod -e CONFIG_PATH=/app/config.prod.yaml \
+  --entrypoint python ml_pipeline src/online_scoring.py
+```
+
+Parámetros en `config.yaml` → sección `online` (`n_samples`, `rate_per_second`, `flush_every`, `monitoring_window_size`, `monitoring_max_samples`, `monitoring_axes`). Overrides: `ONLINE_N_SAMPLES`, `ONLINE_RATE_PER_SECOND`, `ONLINE_MONITORING_WINDOW_SIZE`, `ONLINE_MONITORING_MAX_SAMPLES`.
+
+**Drift sintético en BMI:** flag `--bmi-anomaly` (o `online.bmi_anomaly.enabled: true`). Desde `request_seq` 500, el BMI muestreado se multiplica en rampa lineal hasta **4×** en las siguientes **1000** muestras; después se mantiene en 4×. Útil para validar PSI en Grafana.
+
+```bash
+docker compose run --rm --entrypoint python ml_pipeline \
+  src/online_scoring.py --bmi-anomaly
+```
+
+**Reentrenamiento automático** (`online.auto_retrain`, máximo **1** por sesión online):
+
+- `prediction_psi` ≥ umbral **warning** de `monitoring.psi` y más de `min_samples_prediction` requests (default 700).
+- Cualquier PSI por feature ≥ umbral **alert**.
+- Persiste fila en `online_retrain_alerts` (marcadores en el time series de Prediction PSI en Grafana).
+- Lanza un run MLflow hijo con nombre `retrain_drift_feature_{feature}_YYYYMMDD_HHMMSS` o `retrain_drift_prediction_YYYYMMDD_HHMMSS`, y tags `triggered_by=online_drift`, `trigger_description`, etc.
+
+**Monitoreo temporal:** cada `monitoring_window_size` requests (default 100) se ejecuta `monitor_batch` sobre las **últimas** `monitoring_max_samples` predicciones (default 1500), no todo el historial de la sesión. Se guarda en `online_monitoring_snapshots` + `online_monitoring_psi`. Al cierre, `monitoring_runs` usa la misma ventana (máx. 1500).
+
+**Grafana:** dashboard **Online Predictions** — fila superior con filas analizadas, gauges de PSI, series temporales de prediction PSI y evolución de todos los PSI; debajo, comparación vs baseline de entrenamiento.
+
 ---
 
 ## 4. Dónde se guarda cada cosa
@@ -172,6 +210,7 @@ En Grafana, usá la variable **Environment** (`sandbox` / `prod`) en los dashboa
 | MLflow runs / registry | UI + `./mlartifacts/` |
 | Datos en DB | tablas `training_dataset`, `prod_predictions`, `monitoring_runs`, `training_runs` (columna `environment`) |
 | Prod (MLOps) | `config.prod.yaml`, registry `metlife_insurance_xgb_prod`, script `src/promote_sandbox_to_prod.py` |
+| Online | `online_predictions`, sesiones `online_YYYYMMDD_HHMMSS`, dashboard Grafana Online Predictions |
 | Grafana dashboards | carpeta `MetLife MLOps` en la UI |
 
 ---

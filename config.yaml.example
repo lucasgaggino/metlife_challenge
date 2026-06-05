@@ -110,5 +110,26 @@ scoring:
 mlflow:
   experiment_name: metlife_insurance
 
+# Modo online: simula requests sin target (src/online_scoring.py). Ver GUIDE.md §3.8
+online:
+  source_csv: data/dataset.csv      # CSV para muestrear features (charges no se usan en inferencia)
+  n_samples: 1200                   # total de requests simulados por sesion
+  rate_per_second: 10               # tasa de llegada (10/s -> ~120s para 1200 requests)
+  flush_every: 50                   # cada N predicciones: insert en bloque a online_predictions (DB)
+  monitoring_window_size: 100       # cada N requests: checkpoint PSI -> Grafana (series temporales)
+  monitoring_max_samples: 1500      # en cada checkpoint: analizar solo las ultimas N predicciones (ventana deslizante)
+  session_prefix: online            # session_id = online_YYYYMMDD_HHMMSS
+  feature_columns: [age, sex, bmi, children, smoker, region]
+  monitoring_axes: [drift, schema, prediction_drift]
+  # Inyeccion de drift en BMI (sampler); activar con --bmi-anomaly o enabled: true
+  bmi_anomaly:
+    enabled: false
+    start_at_sample: 500       # request_seq (0-based): primera muestra con rampa
+    duration_samples: 1000   # muestras hasta alcanzar max_multiplier
+    max_multiplier: 4.0
+  auto_retrain:
+    enabled: true
+    min_samples_prediction: 700
+
 logging:
   level: INFO

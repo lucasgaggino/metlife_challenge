@@ -433,6 +433,15 @@ Variable **Environment** (`sandbox` / `prod`) en los dashboards para filtrar fil
 
 Guía operativa: [`GUIDE.md`](GUIDE.md) sección 3.7.
 
+### 8) Modo online (simulación productiva)
+
+`src/online_scoring.py` simula inferencia en tiempo real (requests sin target desde `dataset.csv`), persiste en `online_predictions` y registra una sesión en MLflow. Dashboard **Online Predictions** en Grafana (predicción vs baseline de entrenamiento).
+
+```bash
+docker compose run --rm --entrypoint python ml_pipeline src/online_scoring.py
+docker compose --profile online run --rm ml_pipeline_online
+```
+
 Las tablas extra (`training_runs`, `training_feature_importance`, `baseline_predictions`) las gestiona `src/grafana_utils.py` y **no alteran el flujo del pipeline** (escritura tolerante a fallos). Para validar las queries SQL de los dashboards:
 
 ```bash

@@ -53,6 +53,10 @@ def migrate_environment_columns(engine):
     tables = (
         'prod_predictions',
         'monitoring_runs',
+        'online_predictions',
+        'online_monitoring_snapshots',
+        'online_monitoring_psi',
+        'online_retrain_alerts',
         'training_runs',
         'training_feature_importance',
         'baseline_predictions',
@@ -91,7 +95,13 @@ def drop_tables(engine, environment=None):
     logger.info(f"Limpiando tablas para environment='{environment}'...")
     migrate_environment_columns(engine)
     with engine.connect() as conn:
-        for table in ('prod_predictions', 'monitoring_runs'):
+        for table in (
+            'prod_predictions',
+            'monitoring_runs',
+            'online_predictions',
+            'online_monitoring_snapshots',
+            'online_monitoring_psi',
+        ):
             if _table_exists(conn, table):
                 conn.execute(
                     text(f"DELETE FROM {table} WHERE environment = :env"),
@@ -243,9 +253,35 @@ def create_additional_tables(engine):
                 run_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS online_predictions (
+                id SERIAL PRIMARY KEY,
+                environment VARCHAR(10) NOT NULL DEFAULT 'sandbox',
+                session_id VARCHAR(64) NOT NULL,
+                request_seq INTEGER NOT NULL,
+                age INTEGER,
+                sex VARCHAR(10),
+                bmi FLOAT,
+                children INTEGER,
+                smoker VARCHAR(5),
+                region VARCHAR(20),
+                predicted_charges FLOAT,
+                model_uri VARCHAR(256),
+                latency_ms FLOAT,
+                prediction_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_online_predictions_env_session
+            ON online_predictions (environment, session_id, request_seq)
+        """))
         conn.commit()
+    grafana_utils.create_online_monitoring_tables(engine)
     migrate_environment_columns(engine)
-    logger.info("Tablas 'prod_predictions' y 'monitoring_runs' verificadas.")
+    logger.info(
+        "Tablas prod_predictions, monitoring_runs, online_predictions "
+        "y online_monitoring_* verificadas."
+    )
 
 def ensure_training_dataset(engine):
     """Crea training_dataset si no existe (entorno prod sin recargar CSV)."""

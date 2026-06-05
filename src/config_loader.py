@@ -24,6 +24,10 @@ _ENV_OVERRIDES = {
     'MLFLOW_EXPERIMENT_NAME': ('mlflow', 'experiment_name'),
     'MLFLOW_MODEL_NAME': ('model', 'registry_name'),
     'LOG_LEVEL': ('logging', 'level'),
+    'ONLINE_N_SAMPLES': ('online', 'n_samples'),
+    'ONLINE_RATE_PER_SECOND': ('online', 'rate_per_second'),
+    'ONLINE_MONITORING_WINDOW_SIZE': ('online', 'monitoring_window_size'),
+    'ONLINE_MONITORING_MAX_SAMPLES': ('online', 'monitoring_max_samples'),
 }
 
 _VALID_ML_ENV = frozenset({'sandbox', 'prod'})
@@ -89,8 +93,13 @@ def _apply_env_overrides(cfg: dict) -> None:
             continue
         val = os.getenv(env_key)
         if val is not None and val != '':
-            if path[-1] in ('n_iter', 'cv_folds'):
+            if path[-1] in (
+                'n_iter', 'cv_folds', 'n_samples', 'flush_every',
+                'monitoring_window_size', 'monitoring_max_samples',
+            ):
                 _deep_set(cfg, path, int(val))
+            elif path[-1] == 'rate_per_second':
+                _deep_set(cfg, path, float(val))
             else:
                 _deep_set(cfg, path, val)
 
@@ -179,6 +188,10 @@ def get_monitoring_cfg() -> dict:
 
 def get_scoring_cfg() -> dict:
     return get_config().get('scoring', {})
+
+
+def get_online_cfg() -> dict:
+    return get_config().get('online', {})
 
 
 def get_mlflow_cfg() -> dict:

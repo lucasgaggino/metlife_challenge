@@ -558,96 +558,137 @@ def promote_if_better(model_version, metrics):
     )
     return False
 
+def _build_run_name(trigger: dict | None) -> str:
+    if not trigger:
+        return f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    if trigger.get('type') == 'feature_psi_alert':
+        feat = str(trigger.get('feature', 'unknown'))
+        feat_slug = ''.join(c if c.isalnum() else '_' for c in feat).strip('_') or 'unknown'
+        return f"retrain_drift_feature_{feat_slug}_{ts}"
+    return f"retrain_drift_prediction_{ts}"
+
+
+def _apply_trigger_tags(trigger: dict | None, session_id: str | None = None) -> None:
+    if not trigger:
+        return
+    mlflow.set_tag('trigger_source', 'online_auto_retrain')
+    mlflow.set_tag('trigger_type', trigger['type'])
+    mlflow.set_tag(
+        'trigger_description',
+        trigger.get('reason', 'Reentrenamiento disparado por monitoreo online'),
+    )
+    if session_id:
+        mlflow.set_tag('trigger_online_session', session_id)
+    if trigger.get('feature'):
+        mlflow.log_param('trigger_feature', trigger['feature'])
+    if trigger.get('feature_psi') is not None:
+        mlflow.log_metric('trigger_feature_psi', float(trigger['feature_psi']))
+    if trigger.get('prediction_psi') is not None:
+        mlflow.log_metric('trigger_prediction_psi', float(trigger['prediction_psi']))
+    if trigger.get('end_request_seq') is not None:
+        mlflow.log_param('trigger_at_request_seq', int(trigger['end_request_seq']))
+
+
+def run_training_pipeline(
+    engine=None,
+    *,
+    run_name: str | None = None,
+    trigger: dict | None = None,
+    nested: bool = False,
+    online_session_id: str | None = None,
+) -> dict:
+    """Ejecuta entrenamiento completo. Retorna resumen con run_id y paths."""
+    if engine is None:
+        engine = get_db_engine()
+
+    df = load_training_data(engine)
+    run_name = run_name or _build_run_name(trigger)
+
+    with mlflow.start_run(run_name=run_name, nested=nested) as run:
+        mlflow.set_tag('stage', 'training')
+        if trigger:
+            mlflow.set_tag('triggered_by', 'online_drift')
+            _apply_trigger_tags(trigger, online_session_id)
+        started_at = datetime.now()
+        t0 = time.time()
+
+        logger.info("Preparando features y target...")
+        X, y_transformed, y_original = prepare_features_target(df)
+
+        logger.info("Dividiendo datos en train y validation...")
+        tcfg = get_training_cfg()
+        X_train, X_val, y_train, y_val, y_train_orig, y_val_orig = split_data(
+            X, y_transformed, y_original,
+            test_size=float(tcfg.get('test_size', 0.2)),
+            random_state=int(tcfg.get('random_state_split', 43)),
+        )
+
+        logger.info("Entrenando modelo con RandomizedSearchCV...")
+        best_model, random_search = train_model(X_train, y_train)
+
+        logger.info("Evaluando modelo en el set de validación...")
+        metrics, _y_val_pred = evaluate_model(
+            best_model, X_train, y_train, X_val, y_val, y_train_orig, y_val_orig,
+        )
+
+        logger.info("Guardando modelo y metadata...")
+        model_path = save_model(best_model, metrics, random_search.best_params_)
+
+        report_path = generate_report(metrics, random_search.best_params_, random_search)
+
+        logger.info("Logueando entrenamiento en MLflow y registrando modelo...")
+        model_version = log_training_to_mlflow(best_model, metrics, random_search, report_path)
+
+        is_champion = promote_if_better(model_version, metrics)
+
+        grafana_utils.save_training_run(
+            engine=engine,
+            run_name=run_name,
+            mlflow_run_id=run.info.run_id,
+            model_version=model_version,
+            is_champion=is_champion,
+            df=df,
+            metrics=metrics,
+            random_search=random_search,
+            best_model=best_model,
+            duration_seconds=time.time() - t0,
+            started_at=started_at,
+            finished_at=datetime.now(),
+        )
+
+        logger.info("\n" + "=" * 70)
+        logger.info("TRAINING PIPELINE COMPLETADO EXITOSAMENTE")
+        logger.info("=" * 70)
+        logger.info(f"MLflow run_id: {run.info.run_id}")
+        logger.info(f"Modelo guardado en: {model_path}")
+        logger.info(f"Validation R²: {metrics['validation']['r2']:.4f}")
+        logger.info(f"Validation RMSE: ${metrics['validation']['rmse']:,.2f}")
+
+        return {
+            'success': True,
+            'run_id': run.info.run_id,
+            'run_name': run_name,
+            'is_champion': is_champion,
+            'model_path': model_path,
+            'report_path': report_path,
+            'metrics': metrics,
+        }
+
+
 def main():
     """Función principal para ejecutar el proceso de entrenamiento."""
-    
     try:
         logger.info("Iniciando proceso de entrenamiento...")
         log_config_summary()
-
-        # Paso 0: Configurar MLflow
         setup_mlflow()
-
-        # Paso 1: Conectar a la base de datos
-        engine = get_db_engine()
-
-        # Paso 2: Cargar datos de entrenamiento
-        df = load_training_data(engine)
-        logger.info("Proceso de entrenamiento completado.")
-
-        run_name = f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        with mlflow.start_run(run_name=run_name) as run:
-            mlflow.set_tag('stage', 'training')
-            started_at = datetime.now()
-            t0 = time.time()
-
-            # Paso 3: Preparar features y target
-            logger.info("Preparando features y target...")
-            X, y_transformed, y_original = prepare_features_target(df)
-
-            # Paso 4: Split train/validation
-            logger.info("Dividiendo datos en train y validation...")
-            tcfg = get_training_cfg()
-            X_train, X_val, y_train, y_val, y_train_orig, y_val_orig = split_data(
-                X, y_transformed, y_original,
-                test_size=float(tcfg.get('test_size', 0.2)),
-                random_state=int(tcfg.get('random_state_split', 43)),
-            )
-
-            # Paso 5: Entrenar modelo con RandomizedSearchCV
-            logger.info("Entrenando modelo con RandomizedSearchCV...")
-            best_model, random_search = train_model(X_train, y_train)
-
-            # Paso 6: Evaluar modelo
-            logger.info("Evaluando modelo en el set de validación...")
-            metrics, y_val_pred = evaluate_model(best_model, X_train, y_train, X_val, y_val, y_train_orig, y_val_orig)
-
-            # Paso 7: Guardar modelo y metadata y estadisticas de training
-            logger.info("Guardando modelo y metadata...")
-            model_path = save_model(best_model, metrics, random_search.best_params_)
-
-            # Paso 8: Generar reporte de evaluacion
-            report_path = generate_report(metrics, random_search.best_params_, random_search)
-
-            # Paso 9: Loguear en MLflow y registrar modelo
-            logger.info("Logueando entrenamiento en MLflow y registrando modelo...")
-            model_version = log_training_to_mlflow(best_model, metrics, random_search, report_path)
-
-            # Paso 10: Promover a champion si mejora el RMSE de validacion
-            is_champion = promote_if_better(model_version, metrics)
-
-            # Paso 11: Persistir el run para Grafana (no aborta el pipeline si falla)
-            grafana_utils.save_training_run(
-                engine=engine,
-                run_name=run_name,
-                mlflow_run_id=run.info.run_id,
-                model_version=model_version,
-                is_champion=is_champion,
-                df=df,
-                metrics=metrics,
-                random_search=random_search,
-                best_model=best_model,
-                duration_seconds=time.time() - t0,
-                started_at=started_at,
-                finished_at=datetime.now(),
-            )
-
-            logger.info("\n" + "="*70)
-            logger.info("TRAINING PIPELINE COMPLETADO EXITOSAMENTE")
-            logger.info("="*70)
-            logger.info(f"\nMLflow run_id: {run.info.run_id}")
-            logger.info(f"Modelo guardado en: {model_path}")
-            logger.info(f"Reporte generado en: {report_path}")
-            logger.info(f"\nValidation R²: {metrics['validation']['r2']:.4f}")
-            logger.info(f"Validation RMSE: ${metrics['validation']['rmse']:,.2f}")
-
+        run_training_pipeline()
         return True
-
-
     except Exception as e:
         logger.error(f"\nError en el proceso de entrenamiento: {str(e)}", exc_info=True)
         sys.exit(1)
-        
+
+
 if __name__ == "__main__":
     success = main()
     sys.exit(0 if success else 1)

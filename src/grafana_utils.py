@@ -19,6 +19,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from config_loader import get_environment
+import monitoring
 
 logger = logging.getLogger(__name__)
 
@@ -273,3 +274,203 @@ def save_baseline_predictions(engine, baseline_pred, model_uri):
         logger.info(f"[grafana] {len(df)} baseline_predictions refrescadas (model={model_uri}).")
     except Exception as e:
         logger.warning(f"[grafana] No se pudieron guardar baseline_predictions: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Online monitoring (time series)
+# ---------------------------------------------------------------------------
+def create_online_monitoring_tables(engine):
+    """Crea tablas de snapshots y PSI por ventana para Grafana online."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS online_monitoring_snapshots (
+                    id SERIAL PRIMARY KEY,
+                    environment VARCHAR(10) NOT NULL DEFAULT 'sandbox',
+                    session_id VARCHAR(64) NOT NULL,
+                    window_index INTEGER NOT NULL,
+                    end_request_seq INTEGER NOT NULL,
+                    n_rows INTEGER NOT NULL,
+                    measured_at TIMESTAMP NOT NULL,
+                    max_psi FLOAT,
+                    prediction_psi FLOAT,
+                    schema_violation_pct FLOAT,
+                    status VARCHAR(10),
+                    drift_status VARCHAR(10),
+                    prediction_drift_status VARCHAR(10),
+                    schema_status VARCHAR(10)
+                )
+            """))
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_online_mon_snap_env_session
+                ON online_monitoring_snapshots (environment, session_id, measured_at)
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS online_monitoring_psi (
+                    id SERIAL PRIMARY KEY,
+                    environment VARCHAR(10) NOT NULL DEFAULT 'sandbox',
+                    session_id VARCHAR(64) NOT NULL,
+                    window_index INTEGER NOT NULL,
+                    feature VARCHAR(64) NOT NULL,
+                    psi FLOAT NOT NULL,
+                    measured_at TIMESTAMP NOT NULL
+                )
+            """))
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_online_mon_psi_env_session
+                ON online_monitoring_psi (environment, session_id, feature, measured_at)
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS online_retrain_alerts (
+                    id SERIAL PRIMARY KEY,
+                    environment VARCHAR(10) NOT NULL DEFAULT 'sandbox',
+                    session_id VARCHAR(64) NOT NULL,
+                    window_index INTEGER NOT NULL,
+                    end_request_seq INTEGER NOT NULL,
+                    measured_at TIMESTAMP NOT NULL,
+                    alert_type VARCHAR(48) NOT NULL,
+                    trigger_reason TEXT NOT NULL,
+                    prediction_psi FLOAT,
+                    feature_name VARCHAR(64),
+                    feature_psi FLOAT,
+                    retrain_run_name VARCHAR(128),
+                    retrain_mlflow_run_id VARCHAR(64)
+                )
+            """))
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS idx_online_retrain_alerts_session
+                ON online_retrain_alerts (environment, session_id, measured_at)
+            """))
+            conn.commit()
+        logger.info(
+            "[grafana] Tablas online_monitoring_* y online_retrain_alerts verificadas."
+        )
+    except Exception as e:
+        logger.warning(f"[grafana] No se pudieron crear tablas de monitoreo online: {e}")
+
+
+def save_online_monitoring_snapshot(
+    engine,
+    session_id: str,
+    window_index: int,
+    end_request_seq: int,
+    report: dict,
+    measured_at=None,
+):
+    """Persiste snapshot agregado + PSI por feature (ventana online)."""
+    try:
+        env = get_environment()
+        if measured_at is None:
+            measured_at = pd.Timestamp.utcnow()
+        snap = monitoring.snapshot_from_report(report)
+        row = {
+            'environment': env,
+            'session_id': session_id,
+            'window_index': int(window_index),
+            'end_request_seq': int(end_request_seq),
+            'n_rows': snap['n_rows'],
+            'measured_at': measured_at,
+            'max_psi': snap['max_psi'],
+            'prediction_psi': snap['prediction_psi'],
+            'schema_violation_pct': snap['schema_violation_pct'],
+            'status': snap['status'],
+            'drift_status': snap['drift_status'],
+            'prediction_drift_status': snap['prediction_drift_status'],
+            'schema_status': snap['schema_status'],
+        }
+        create_online_monitoring_tables(engine)
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO online_monitoring_snapshots (
+                        environment, session_id, window_index, end_request_seq,
+                        n_rows, measured_at, max_psi, prediction_psi,
+                        schema_violation_pct, status, drift_status,
+                        prediction_drift_status, schema_status
+                    ) VALUES (
+                        :environment, :session_id, :window_index, :end_request_seq,
+                        :n_rows, :measured_at, :max_psi, :prediction_psi,
+                        :schema_violation_pct, :status, :drift_status,
+                        :prediction_drift_status, :schema_status
+                    )
+                """),
+                row,
+            )
+            conn.commit()
+
+        psi_rows = monitoring.flatten_psi_rows(
+            report, env, session_id, window_index, measured_at,
+        )
+        if psi_rows:
+            pd.DataFrame(psi_rows).to_sql(
+                'online_monitoring_psi',
+                engine,
+                if_exists='append',
+                index=False,
+                method='multi',
+            )
+        logger.info(
+            f"[grafana] Snapshot online window={window_index} session={session_id} "
+            f"(n_rows={snap['n_rows']}, pred_psi={snap['prediction_psi']})"
+        )
+    except Exception as e:
+        logger.warning(
+            f"[grafana] No se pudo guardar snapshot online "
+            f"session={session_id} window={window_index}: {e}"
+        )
+
+
+def save_online_retrain_alert(
+    engine,
+    session_id: str,
+    window_index: int,
+    end_request_seq: int,
+    trigger: dict,
+    measured_at=None,
+    retrain_run_name: str | None = None,
+    retrain_mlflow_run_id: str | None = None,
+):
+    """Persiste alerta de reentrenamiento para marcadores en Grafana."""
+    try:
+        env = get_environment()
+        if measured_at is None:
+            measured_at = pd.Timestamp.utcnow()
+        create_online_monitoring_tables(engine)
+        row = {
+            'environment': env,
+            'session_id': session_id,
+            'window_index': int(window_index),
+            'end_request_seq': int(end_request_seq),
+            'measured_at': measured_at,
+            'alert_type': trigger['type'],
+            'trigger_reason': trigger['reason'],
+            'prediction_psi': trigger.get('prediction_psi'),
+            'feature_name': trigger.get('feature'),
+            'feature_psi': trigger.get('feature_psi'),
+            'retrain_run_name': retrain_run_name,
+            'retrain_mlflow_run_id': retrain_mlflow_run_id,
+        }
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO online_retrain_alerts (
+                        environment, session_id, window_index, end_request_seq,
+                        measured_at, alert_type, trigger_reason, prediction_psi,
+                        feature_name, feature_psi, retrain_run_name, retrain_mlflow_run_id
+                    ) VALUES (
+                        :environment, :session_id, :window_index, :end_request_seq,
+                        :measured_at, :alert_type, :trigger_reason, :prediction_psi,
+                        :feature_name, :feature_psi, :retrain_run_name, :retrain_mlflow_run_id
+                    )
+                """),
+                row,
+            )
+            conn.commit()
+        logger.info(
+            f"[grafana] Alerta retrain online session={session_id} "
+            f"type={trigger['type']} req={end_request_seq}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"[grafana] No se pudo guardar alerta retrain session={session_id}: {e}"
+        )

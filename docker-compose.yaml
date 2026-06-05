@@ -157,6 +157,46 @@ services:
     networks:
       - metlife_network
 
+  # Simulacion modo online (profile online)
+  ml_pipeline_online:
+    profiles: ["online"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: metlife_ml_pipeline_online
+    restart: "no"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+
+    environment:
+      DB_HOST: postgres
+      DB_PORT: ${DB_PORT:-5432}
+      DB_NAME: ${DB_NAME:-metlife_db}
+      DB_USER: ${DB_USER:-metlife_user}
+      DB_PASSWORD: ${DB_PASSWORD:-metlife_pass}
+
+      ML_ENV: ${ML_ENV:-sandbox}
+      CONFIG_PATH: /app/config.yaml
+      PYTHONUNBUFFERED: 1
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+
+    entrypoint: ["python", "src/online_scoring.py"]
+    volumes:
+      - ./models:/app/models
+      - ./results:/app/results
+      - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro
+      - ./config.prod.yaml:/app/config.prod.yaml:ro
+
+    networks:
+      - metlife_network
+
   # Grafana: dashboards de analisis (lee de Postgres)
   grafana:
     image: grafana/grafana:11.3.0

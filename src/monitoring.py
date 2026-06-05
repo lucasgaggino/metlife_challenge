@@ -298,3 +298,100 @@ def monitor_batch(batch_name, features_df, predicted, actual, reference_df,
         'prediction_drift': prediction_drift,
         'schema': schema,
     }
+
+
+def snapshot_from_report(report: dict) -> dict:
+    """Plano serializable para persistencia de snapshots online (Grafana)."""
+    pred_drift = report.get('prediction_drift') or {}
+    drift = report.get('drift') or {}
+    schema = report.get('schema') or {}
+    return {
+        'n_rows': int(report.get('n_rows', 0)),
+        'status': report.get('status'),
+        'max_psi': float(drift.get('max_psi', 0.0)),
+        'prediction_psi': float(pred_drift['psi']) if pred_drift.get('psi') is not None else None,
+        'schema_violation_pct': float(schema.get('violation_pct', 0.0)),
+        'drift_status': drift.get('status'),
+        'prediction_drift_status': pred_drift.get('status'),
+        'schema_status': schema.get('status'),
+        'psi_by_feature': dict(drift.get('psi_by_feature') or {}),
+    }
+
+
+def evaluate_online_retrain_trigger(
+    snap: dict,
+    n_requests_done: int,
+    *,
+    min_samples_prediction: int = 700,
+) -> dict | None:
+    """Evalua si debe dispararse reentrenamiento automatico en modo online.
+
+    - prediction_psi > umbral warning y n_requests_done > min_samples_prediction
+    - cualquier PSI por feature >= umbral alert
+    """
+    apply_monitoring_config()
+
+    psi_by_feature = snap.get('psi_by_feature') or {}
+    for feat, psi in psi_by_feature.items():
+        _, alert = _psi_thresholds_for_feature(feat)
+        if float(psi) >= alert:
+            return {
+                'type': 'feature_psi_alert',
+                'feature': feat,
+                'feature_psi': float(psi),
+                'alert_threshold': alert,
+                'prediction_psi': snap.get('prediction_psi'),
+                'reason': (
+                    f"PSI({feat})={float(psi):.4f} >= alert={alert:.4f} "
+                    f"(request {n_requests_done})"
+                ),
+            }
+
+    pred_psi = snap.get('prediction_psi')
+    if pred_psi is not None and n_requests_done > min_samples_prediction:
+        warn, _ = _psi_thresholds_for_feature('predicted_charges')
+        if float(pred_psi) >= warn:
+            return {
+                'type': 'prediction_psi_warning',
+                'feature': None,
+                'feature_psi': None,
+                'prediction_psi': float(pred_psi),
+                'warning_threshold': warn,
+                'reason': (
+                    f"PSI(predicted_charges)={float(pred_psi):.4f} >= warning={warn:.4f} "
+                    f"y muestras={n_requests_done} > {min_samples_prediction}"
+                ),
+            }
+
+    return None
+
+
+def flatten_psi_rows(
+    report: dict,
+    environment: str,
+    session_id: str,
+    window_index: int,
+    measured_at,
+) -> list[dict]:
+    """Filas largas (feature, psi) para online_monitoring_psi."""
+    snap = snapshot_from_report(report)
+    rows = []
+    for feature, psi in snap['psi_by_feature'].items():
+        rows.append({
+            'environment': environment,
+            'session_id': session_id,
+            'window_index': window_index,
+            'feature': feature,
+            'psi': float(psi),
+            'measured_at': measured_at,
+        })
+    if snap['prediction_psi'] is not None:
+        rows.append({
+            'environment': environment,
+            'session_id': session_id,
+            'window_index': window_index,
+            'feature': 'predicted_charges',
+            'psi': snap['prediction_psi'],
+            'measured_at': measured_at,
+        })
+    return rows
