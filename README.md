@@ -539,10 +539,81 @@ docker compose up --build
 
 Borra volúmenes de Postgres y Grafana; pierde historial de `training_runs` en DB.
 
+---
 
+## 10. Tests y CI
 
+### Ejecutar tests localmente
 
-## 10. Referencias en el repo
+```bash
+pip install -r requirements.txt
+pytest tests/
+```
+
+Los tests unitarios cubren funciones puras de `src/monitoring.py` y `src/training.py`. No requieren PostgreSQL ni MLflow.
+
+### Catálogo de tests (28)
+
+#### `tests/test_monitoring.py` — monitoreo (`src/monitoring.py`)
+
+| Test | Descripción breve |
+|------|-------------------|
+| `test_identical_distributions_near_zero` | PSI numérico ≈ 0 cuando referencia y actual son iguales. |
+| `test_shifted_distribution_positive` | PSI numérico > 0 cuando la distribución actual está desplazada. |
+| `test_constant_reference_returns_zero` | PSI numérico = 0 si la referencia es constante (sin bins útiles). |
+| `test_same_categories_near_zero` | PSI categórico ≈ 0 con las mismas categorías en ambos lados. |
+| `test_new_category_positive` | PSI categórico > 0 cuando aparece una categoría nueva en el batch actual. |
+| `test_ok_and_warning` | `worst_status` devuelve `WARNING` si algún eje está en warning. |
+| `test_warning_and_alert` | `worst_status` devuelve `ALERT` si algún eje está en alerta. |
+| `test_empty_returns_ok` | `worst_status` sin estados de entrada devuelve `OK`. |
+| `test_identical_predictions_ok` | Drift de predicciones en `OK` si referencia y actual coinciden. |
+| `test_heavily_shifted_predictions_alert` | Drift de predicciones en `ALERT` con distribución muy desplazada. |
+| `test_valid_rows_ok` | `check_schema` en `OK` con filas dentro de rangos y dominios válidos. |
+| `test_out_of_range_numeric_warning` | `check_schema` en `WARNING` por valor numérico fuera de rango (1 % de filas). |
+| `test_invalid_category_warning` | `check_schema` en `WARNING` por categoría inválida (1 % de filas). |
+| `test_perfect_predictions` | `compute_performance` con RMSE 0 y estado `OK` si predicción = real. |
+| `test_rmse_ratio_alert` | `compute_performance` en `ALERT` cuando el ratio RMSE supera el umbral vs baseline. |
+| `test_extracts_expected_keys` | `snapshot_from_report` extrae PSI, schema y metadatos del reporte de batch. |
+| `test_feature_psi_alert_triggers` | `evaluate_online_retrain_trigger` dispara retrain por PSI de feature ≥ alerta. |
+| `test_low_sample_count_no_prediction_trigger` | No dispara retrain por PSI de predicción si hay pocas muestras. |
+| `test_no_trigger_when_psi_low` | No dispara retrain cuando PSI de features y predicciones están bajo umbral. |
+
+#### `tests/test_training.py` — entrenamiento (`src/training.py`)
+
+| Test | Descripción breve |
+|------|-------------------|
+| `test_default_prefix` | `_build_run_name(None)` genera nombre con prefijo `train_` + timestamp. |
+| `test_feature_psi_alert` | `_build_run_name` con drift de feature → `retrain_drift_feature_{feat}_…`. |
+| `test_prediction_trigger` | `_build_run_name` con drift de predicción → `retrain_drift_prediction_…`. |
+| `test_drops_id_and_created_at` | `prepare_features_target` elimina `id`, `created_at` y `charges` de X. |
+| `test_adds_engineered_columns` | `prepare_features_target` agrega las 6 features derivadas del config. |
+| `test_target_log_transform` | `prepare_features_target` aplica `log1p` al target según `config.yaml`. |
+| `test_split_sizes` | `split_data` respeta `test_size=0.2` y alinea longitudes train/val. |
+| `test_returns_model_prefixed_keys` | `define_hyperparameter_grid` devuelve claves `model__…` desde config. |
+| `test_returns_column_transformer` | `create_preprocessor` devuelve `ColumnTransformer` num + cat. |
+
+### GitHub Actions
+
+El workflow [`.github/workflows/python-app.yml`](.github/workflows/python-app.yml) corre en cada push y pull request hacia `main`:
+
+1. **flake8** — errores de sintaxis y lint básico.
+2. **pytest tests/** — suite unitaria.
+
+### Bloquear merge a `main` sin CI verde
+
+La configuración del workflow no impide merges por sí sola. En GitHub, después de que el workflow haya corrido al menos una vez en un PR:
+
+1. **Settings → Branches** (o **Rules → Rulesets**) → regla para la rama `main`.
+2. Activar **Require a pull request before merging** (si usás PRs).
+3. Activar **Require status checks to pass before merging**.
+4. Marcar el check **`build`** (puede aparecer como **Python application / build**).
+5. Recomendado: **Require branches to be up to date before merging**.
+
+Hasta configurar el paso 3–4, un PR puede mergearse aunque falle pytest.
+
+---
+
+## 11. Referencias en el repo
 
 | Documento | Contenido |
 |-----------|-----------|
