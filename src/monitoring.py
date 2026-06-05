@@ -36,8 +36,7 @@ def apply_monitoring_config():
     """Recarga umbrales desde config.yaml."""
     global PSI_WARNING, PSI_ALERT, PERF_WARNING_RATIO, PERF_ALERT_RATIO
     global SCHEMA_WARNING_PCT, SCHEMA_ALERT_PCT, PSI_N_BINS, PSI_EPSILON
-    global PSI_PER_FEATURE, NUMERIC_RANGES, CATEGORICAL_DOMAINS
-    global DRIFT_NUMERIC, DRIFT_CATEGORICAL, ENABLED_AXES
+    global PSI_PER_FEATURE
 
     m = get_monitoring_cfg()
     psi = m.get('psi', {})
