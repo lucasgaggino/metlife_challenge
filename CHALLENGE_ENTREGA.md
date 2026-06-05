@@ -16,15 +16,28 @@ El repositorio predice el costo de seguro médico (`charges`, en USD) a partir d
 
 El monitoreo **no corrige** anomalías en los datos; las **detecta y clasifica**.
 
+**Extensiones implementadas** (más allá del enunciado mínimo en `challenge_ml.md`):
+
+- Entornos **Sandbox** y **Prod** (registries MLflow separados, columna `environment` en Postgres).
+- **Grafana** con dashboards de entrenamiento, scoring batch y modo online.
+- **Modo online** (`online_scoring.py`): simulación de requests sin target, monitoreo temporal (PSI) y **reentrenamiento automático** ante drift (máx. 1× por sesión).
+- Promoción manual Sandbox → Prod (`promote_sandbox_to_prod.py`).
+- Tests unitarios (`tests/`) y CI con GitHub Actions.
+
+Guía operativa: [README.md](README.md).
+
 ---
 
 ## 2. Arquitectura de la solución
+
+### 2.1 Pipeline batch (challenge core)
 
 ```mermaid
 flowchart LR
   subgraph infra [Infra]
     PG[(PostgreSQL)]
     MLF[MLflow :5000]
+    GF[Grafana :3000]
   end
   DB[db_setup.py]
   TR[training.py]
@@ -38,19 +51,34 @@ flowchart LR
   DB --> SC
   SC --> T1[(prod_predictions)]
   SC --> T2[(monitoring_runs)]
-  SC --> R[results/]
+  SC --> T3[(baseline_predictions)]
+  SC --> R[results/ bind mount]
+  TR --> M[models/ bind mount]
   SC --> MLF
+  TR --> GF
+  SC --> GF
+  PG --> GF
 ```
 
-**Orden de ejecución** (`entrypoint.sh`): esperar Postgres y MLflow → `db_setup.py` → `training.py` → `scoring.py`.
+Orquestación default: `entrypoint.sh` → `db_setup` → `training` → `scoring`. Salidas locales (`models/`, `results/`, `logs/`, `config.yaml`) son **bind mounts** del host al contenedor `ml_pipeline` (ver README section 4).
 
-| Componente | Rol |
-|------------|-----|
-| `postgres` | `metlife_db` (datos app) + `mlflow_db` (tracking) |
-| `mlflow` | UI `http://localhost:5000`, artefactos en `./mlartifacts` |
-| `src/training.py` | XGBoost + MLflow + promoción `@champion` |
-| `src/scoring.py` | Inferencia prod1/2/3 + persistencia + monitoreo |
-| `src/monitoring.py` | PSI, schema, performance por batch |
+### 2.2 Modo online y auto-retrain (extensión)
+
+```mermaid
+flowchart TB
+  SC[scoring.py previo]
+  ON[online_scoring.py]
+  MON[monitoring.py checkpoints]
+  TR2[training.py retrain_drift_*]
+  SC -->|baseline_predictions| ON
+  ON -->|cada N requests| MON
+  MON -->|PSI alert o pred warning| TR2
+  TR2 -->|nuevo @champion| ON
+  MON --> AL[(online_retrain_alerts)]
+  AL --> GF[Grafana Online Predictions]
+```
+
+No forma parte de `docker compose up`; se ejecuta a mano o con profile `online`.
 
 ---
 
@@ -75,6 +103,7 @@ Los batches en `data/prod/` simulan escenarios reales de degradación. Ejemplos 
 
 **Problema técnico:** usar `pd.read_csv(..., decimal=',')` **partía** el valor porque la coma actuaba como separador de columnas (ej. `14700,80931` → dos columnas; se tomaba solo `80931`).
 
+**Solución:** leer el CSV con `sep=';'` (una columna) y reemplazar coma decimal por punto en la serie (`str.replace(',', '.')`). Así prod1 conserva ~14 700 USD y prod2 queda con el valor corrupto ~1.47M para que el eje **performance** dispare ALERT.
 
 ### 4.2 Drift — PSI (`src/monitoring.py`)
 
@@ -103,8 +132,18 @@ Reglas fijas: `age` 18–100, `bmi` 10–60, `children` 0–10, dominios categó
 | Salida reproducible | Tablas `prod_predictions`, `monitoring_runs`; reportes `results/monitoring_report_*` |
 | Monitoreo OK/WARNING/ALERT | Tres ejes en `monitoring.py`; estado = peor eje |
 | Docker / env | `docker-compose.yaml`, `.env.template`, `MLFLOW_*` |
+| Documentación reproducible | [README.md](README.md) (entrenamiento, scoring, monitoreo, online) |
 
-**Modelo:** XGBoost en `Pipeline` (OneHot + regresión), target `log1p(charges)`, mismas features derivadas en train y score (`utils.feature_engineering`).
+### 5.1 Bonus del enunciado (`challenge_ml.md`)
+
+| Bonus | Estado |
+|-------|--------|
+| Model Registry + alias champion | `@champion` en sandbox y prod |
+| Script de promoción | `promote_sandbox_to_prod.py` (sandbox → registry prod) |
+| Dashboards de monitoreo | Grafana: Training data review, Training review, Prod Predictions, **Online Predictions** |
+| Tests unitarios | `tests/test_monitoring.py`, `tests/test_training.py`; CI en `.github/workflows/python-app.yml` |
+
+**Modelo:** XGBoost en `Pipeline` (OneHot + regresión), target `log1p(charges)`, mismas features derivadas en train y score (`utils.feature_engineering`). Config centralizada en `config.yaml` + `config_loader.py`.
 
 **Champion — hiperparámetros (última corrida):**
 
@@ -170,37 +209,75 @@ Fuente: `results/monitoring_report_20260603_100049.json` (1.338 filas por batch)
 
 ---
 
-## 8. Reproducir y evidencia
+## 8. Extensiones MLOps (post-challenge)
 
-```powershell
-cd \metlife-challenge-mlops
+### 8.1 Entornos Sandbox y Prod
 
-# Pipeline completo
-docker compose up --build
+| | Sandbox | Prod (MLOps) |
+|--|---------|----------------|
+| MLflow experiment | `metlife_insurance` | `metlife_insurance_prod` |
+| Model Registry | `metlife_insurance_xgb` | `metlife_insurance_xgb_prod` |
+| Config | `config.yaml` | `config.prod.yaml` (merge) |
+| Postgres | `environment='sandbox'` | `environment='prod'` |
 
-# Solo re-entrenar y re-scorear (con postgres + mlflow arriba)
-docker compose up -d postgres mlflow
-docker compose run --rm ml_pipeline python src/training.py
-docker compose run --rm ml_pipeline python src/scoring.py
-```
+Los batches `prod1`/`prod2`/`prod3` en `data/prod/` son **datos de scoring del challenge**, no el entorno MLOps Prod.
 
-| Evidencia | Dónde |
+### 8.2 Modo online (`src/online_scoring.py`)
+
+- Simula inferencia sin target muestreando `data/dataset.csv` (tasa y volumen en `config.yaml` → `online`).
+- Persiste `online_predictions`; checkpoints cada `monitoring_window_size` sobre ventana deslizante (`monitoring_max_samples`).
+- Tablas temporales: `online_monitoring_snapshots`, `online_monitoring_psi`.
+- Flag `--bmi-anomaly`: rampa de multiplicador en BMI para simular covariate drift (parámetros en `online.bmi_anomaly`).
+
+### 8.3 Reentrenamiento automático por drift online
+
+Disparadores (máximo **un** reentrenamiento por sesión online), evaluados en cada checkpoint:
+
+| Condición | Umbral |
 |-----------|--------|
-| MLflow UI | http://localhost:5000 — experimento `metlife_insurance`, modelo `@champion`, runs `train_*` y `score_prod*` |
-| Hiperparámetros y métricas del champion | `models/best_model_metadata.json` |
-| Reporte de monitoreo legible | `results/monitoring_report_*.txt` |
-| Predicciones en DB | tabla `prod_predictions` |
-| Resumen por batch en DB | tabla `monitoring_runs` |
+| PSI de predicción | ≥ `monitoring.psi.warning` y más de `online.auto_retrain.min_samples_prediction` requests (default 700) |
+| PSI por feature | ≥ `monitoring.psi.alert` (cualquier covariable) |
+
+Acciones: run MLflow hijo con nombre `retrain_drift_feature_{feature}_YYYYMMDD_HHMMSS` o `retrain_drift_prediction_YYYYMMDD_HHMMSS`, tags `triggered_by=online_drift`, fila en `online_retrain_alerts` (marcadores en Grafana), recarga del `@champion` y actualización de `baseline_predictions`.
+
+### 8.4 Grafana
+
+Dashboards provisionados desde `grafana/dashboards/` (carpeta **MetLife MLOps**):
+
+- **Training data review** — EDA de `training_dataset`
+- **Training review** — métricas e importancia por run
+- **Prod Predictions** — batch vs baseline (scoring)
+- **Online Predictions** — PSI temporal, alertas de retrain, comparación vs baseline
+
+Datos vía PostgreSQL (`training_runs`, `prod_predictions`, `online_monitoring_*`, etc.).
+
+### 8.5 Calidad y CI
+
+- `pytest tests/` — PSI, schema, performance, triggers de auto-retrain (`evaluate_online_retrain_trigger`).
+- GitHub Actions: flake8 + pytest en push/PR a `main`.
 
 ---
 
-## 9. Decisiones documentadas (ambigüedades)
+## 9. Decisiones documentadas
 
-- **Target prod:** una columna con coma decimal; no se “arregla” prod2 en ingestión.
-- **Champion:** solo compara `validation_rmse` en USD; no MAE ni R².
+- **Target prod:** una columna con coma decimal; no se “arregla” prod2 en ingestión (se detecta por performance).
+- **Champion:** solo compara `validation_rmse` en USD; no MAE ni R² (`promotion` en `config.yaml`).
 - **PSI:** bins de ancho fijo (no cuantiles) para evitar falsos positivos en `age`.
-- **Baseline de monitoreo:** RMSE de validación del champion local (`best_model_metadata.json`).
+- **Baseline de monitoreo batch:** RMSE de validación del champion; predicciones de referencia en `baseline_predictions` (scoring).
+- **Online sin target:** ejes `performance` desactivados vía `online.monitoring_axes`; drift + schema + prediction_drift.
+- **Auto-retrain online:** un solo intento por sesión; el run de entrenamiento queda anidado bajo el run `stage=online` en MLflow.
+- **Sandbox vs Prod:** entrenar y experimentar en sandbox; prod registry se alimenta con promoción explícita, no con el `up` default.
 
 ---
 
-*Autor: Lucas Gaggino — Challenge MLOps MetLife*
+## 10. Reproducibilidad
+
+| Objetivo | Dónde |
+|----------|-------|
+| Ejecutar el challenge de punta a punta | [README.md](README.md) section 3 |
+| Parámetros ML sin tocar código | `config.yaml` / `config.yaml.example` |
+| Modo online + drift sintético | README section 3.8 y section 9 |
+| Enunciado y criterios de aceptación | [challenge_ml.md](challenge_ml.md) |
+
+---
+

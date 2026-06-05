@@ -185,7 +185,7 @@ docker compose run --rm -e ML_ENV=prod -e CONFIG_PATH=/app/config.prod.yaml \
   --entrypoint python ml_pipeline src/online_scoring.py
 ```
 
-Parámetros en `config.yaml` → sección `online` (ver también §5.2). Overrides por env: `ONLINE_N_SAMPLES`, `ONLINE_RATE_PER_SECOND`, `ONLINE_MONITORING_WINDOW_SIZE`, `ONLINE_MONITORING_MAX_SAMPLES`.
+Parámetros en `config.yaml` → sección `online` (ver también section 5.2). Overrides por env: `ONLINE_N_SAMPLES`, `ONLINE_RATE_PER_SECOND`, `ONLINE_MONITORING_WINDOW_SIZE`, `ONLINE_MONITORING_MAX_SAMPLES`.
 
 **Drift sintético en BMI:** flag `--bmi-anomaly` (o `online.bmi_anomaly.enabled: true`). Desde `request_seq` 500, el BMI muestreado se multiplica en rampa lineal hasta `max_multiplier` (configurable en `online.bmi_anomaly.max_multiplier`; p. ej. **1.7** en `config.yaml`, **4.0** en `config.yaml.example`) en las siguientes **1000** muestras; después se mantiene en ese factor. Útil para validar PSI y auto-retrain en Grafana.
 
