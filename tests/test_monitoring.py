@@ -34,7 +34,6 @@ class TestComputePsi:
         cur = np.array([1.0, 9.0, 5.0])
         assert compute_psi(ref, cur) == 0.0
 
-
 class TestComputePsiCategorical:
     def test_same_categories_near_zero(self):
         ref = ['a', 'b', 'a', 'b', 'a']
