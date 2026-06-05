@@ -110,7 +110,7 @@ scoring:
 mlflow:
   experiment_name: metlife_insurance
 
-# Modo online: simula requests sin target (src/online_scoring.py). Ver GUIDE.md §3.8
+# Modo online: simula requests sin target (src/online_scoring.py). Ver README.md §3.8
 online:
   source_csv: data/dataset.csv      # CSV para muestrear features (charges no se usan en inferencia)
   n_samples: 1200                   # total de requests simulados por sesion
@@ -126,7 +126,7 @@ online:
     enabled: false
     start_at_sample: 500       # request_seq (0-based): primera muestra con rampa
     duration_samples: 1000   # muestras hasta alcanzar max_multiplier
-    max_multiplier: 4.0
+    max_multiplier: 1.7
   auto_retrain:
     enabled: true
     min_samples_prediction: 700
