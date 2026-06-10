@@ -42,7 +42,7 @@ training:
     bmi_obese_threshold: 30
     age_senior_threshold: 50
   hyperparam_search:
-    method: randomized
+    method: randomized #RandomizedSearchCV
     n_iter: 50
     cv_folds: 5
     scoring: neg_root_mean_squared_error

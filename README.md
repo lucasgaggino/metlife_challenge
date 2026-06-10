@@ -190,8 +190,7 @@ Parámetros en `config.yaml` → sección `online` (ver también section 5.2). O
 **Drift sintético en BMI:** flag `--bmi-anomaly` (o `online.bmi_anomaly.enabled: true`). Desde `request_seq` 500, el BMI muestreado se multiplica en rampa lineal hasta `max_multiplier` (configurable en `online.bmi_anomaly.max_multiplier`; p. ej. **1.7** en `config.yaml`, **4.0** en `config.yaml.example`) en las siguientes **1000** muestras; después se mantiene en ese factor. Útil para validar PSI y auto-retrain en Grafana.
 
 ```bash
-docker compose run --rm --entrypoint python ml_pipeline \
-  src/online_scoring.py --bmi-anomaly
+docker compose run --rm --entrypoint python ml_pipeline src/online_scoring.py --bmi-anomaly
 ```
 
 **Reentrenamiento automático** (`online.auto_retrain`, máximo **1** por sesión online):
