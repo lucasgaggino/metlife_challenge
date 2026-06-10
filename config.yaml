@@ -19,7 +19,7 @@ promotion:
   metric: validation_rmse
   direction: minimize
   split: validation
-  block_if_overfitting: false
+  block_if_overfitting: true
   max_r2_diff: 0.15
 
 training:
